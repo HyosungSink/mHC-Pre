@@ -1,0 +1,30 @@
+{
+  "schema": "mhc_pre_mock_cases/v1",
+  "category": "mock",
+  "description": "Deterministic local smoke cases for mixed-precision kernel paths.",
+  "recipe": "mhc_pre_mock_pattern/v1",
+  "cases": [
+    {
+      "case_id": "mock_n4_d16",
+      "shape": [1, 40, 4, 16],
+      "x_dtype": "float16",
+      "param_dtype": "float32",
+      "has_gamma": true,
+      "norm_eps": 1e-6,
+      "hc_eps": 1e-6,
+      "abs_tolerance": 0.04,
+      "rel_tolerance": 0.008
+    },
+    {
+      "case_id": "mock_n8_d16",
+      "shape": [1, 7, 8, 16],
+      "x_dtype": "float16",
+      "param_dtype": "float32",
+      "has_gamma": true,
+      "norm_eps": 1e-6,
+      "hc_eps": 1e-6,
+      "abs_tolerance": 0.04,
+      "rel_tolerance": 0.008
+    }
+  ]
+}

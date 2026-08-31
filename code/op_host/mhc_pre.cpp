@@ -224,9 +224,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     const uint32_t dtypeX = static_cast<uint32_t>(xType);
     const uint32_t dtypeParam = static_cast<uint32_t>(paramType);
-    ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam);
+    const uint32_t fastSmall =
+        shapeInfo.n == 4U && shapeInfo.d == 16U && shapeInfo.width == 64U &&
+        shapeInfo.rowCount == 24U ? 1U : 0U;
+    ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall);
+    const uint64_t fastSmallBlockCap = shapeInfo.positionCount <= 16U ? 4U : 16U;
+    const uint64_t availableBlocks =
+        fastSmall != 0U ? std::min<uint64_t>(coreCount, fastSmallBlockCap) : coreCount;
     const uint32_t blockDim = static_cast<uint32_t>(
-        std::min<uint64_t>(coreCount, shapeInfo.positionCount));
+        std::min<uint64_t>(availableBlocks, shapeInfo.positionCount));
     if (context->SetBlockDim(blockDim) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }

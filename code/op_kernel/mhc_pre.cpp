@@ -29,19 +29,19 @@ public:
         hPostGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(hPost));
         hResGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(hRes));
 
-        xRaw_ = LocalTensor<DT_X>(TPosition::VECCALC, kXRawAddress, kWidth);
-        paramRaw_ = LocalTensor<DT_PARAM>(TPosition::VECCALC, kParamRawAddress, kParamLength);
-        xFloat_ = LocalTensor<float>(TPosition::VECCALC, kXFloatAddress, kWidth);
-        paramFloat_ = LocalTensor<float>(TPosition::VECCALC, kParamFloatAddress, kParamLength);
+        xRaw_ = LocalTensor<DT_X>(TPosition::VECIN, kXRawAddress, kWidth);
+        paramRaw_ = LocalTensor<DT_PARAM>(TPosition::VECIN, kParamRawAddress, kParamLength);
+        xFloat_ = LocalTensor<float>(TPosition::VECIN, kXFloatAddress, kWidth);
+        paramFloat_ = LocalTensor<float>(TPosition::VECIN, kParamFloatAddress, kParamLength);
         product_ = LocalTensor<float>(TPosition::VECCALC, kProductAddress, kProductLength);
-        hInAcc_ = LocalTensor<float>(TPosition::VECCALC, kHInAddress, kWidth);
+        hInAcc_ = LocalTensor<float>(TPosition::VECOUT, kHInAddress, kWidth);
         reduceOut_ = LocalTensor<float>(TPosition::VECCALC, kReduceAddress, 8U);
-        scalarIn_ = LocalTensor<float>(TPosition::VECCALC, kScalarInAddress, 8U);
+        scalarIn_ = LocalTensor<float>(TPosition::VECOUT, kScalarInAddress, 8U);
         scalarOut_ = LocalTensor<float>(TPosition::VECCALC, kScalarOutAddress, 8U);
         scalarAux_ = LocalTensor<float>(TPosition::VECCALC, kScalarAuxAddress, 8U);
-        rowAcc_ = LocalTensor<float>(TPosition::VECCALC, kRowAddress, 32U);
-        xOutRaw_ = LocalTensor<DT_X>(TPosition::VECCALC, kXOutAddress, 16U);
-        paramOutRaw_ = LocalTensor<DT_PARAM>(TPosition::VECCALC, kParamOutAddress, 32U);
+        rowAcc_ = LocalTensor<float>(TPosition::VECOUT, kRowAddress, 32U);
+        xOutRaw_ = LocalTensor<DT_X>(TPosition::VECOUT, kXOutAddress, 16U);
+        paramOutRaw_ = LocalTensor<DT_PARAM>(TPosition::VECOUT, kParamOutAddress, 32U);
     }
 
     __aicore__ inline void Process()
@@ -51,6 +51,11 @@ public:
         const uint32_t blockCount = GetBlockNum();
         bool waitsForPreviousStore = false;
         for (uint64_t position = blockIndex; position < positionCount_; position += blockCount) {
+            if constexpr (IsSameType<DT_X, float>::value) {
+                if (position != blockIndex) {
+                    WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
+                }
+            }
             LoadX(position * kWidth);
             if (waitsForPreviousStore) {
                 WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -68,9 +73,15 @@ public:
             float hPre3;
             Transform(invRms, hPre0, hPre1, hPre2, hPre3);
             ComputeHIn(hPre0, hPre1, hPre2, hPre3);
+            const bool hasNextPosition = position + blockCount < positionCount_;
+            if constexpr (IsSameType<DT_X, float>::value) {
+                if (hasNextPosition) {
+                    SetFlag<HardEvent::V_MTE2>(EVENT_ID1);
+                }
+            }
             StoreOutputs(position);
 
-            waitsForPreviousStore = position + blockCount < positionCount_;
+            waitsForPreviousStore = hasNextPosition;
             if (waitsForPreviousStore) {
                 SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
             }
@@ -184,14 +195,15 @@ private:
     {
         Mul(product_, xFloat_, xFloat_, kWidth);
         PipeBarrier<PIPE_V>();
-        WholeReduceSum(reduceOut_, product_, static_cast<int32_t>(kWidth), 1, 1, 1, 8);
+        RepeatReduceSum(reduceOut_, product_, 1, static_cast<int32_t>(kWidth),
+                        0, 1, 1, 8);
 
         const BinaryRepeatParams projectionStrides{1, 1, 1, 8, 0, 8};
         Mul(product_, xFloat_, paramFloat_, static_cast<uint64_t>(kWidth),
             static_cast<uint8_t>(kRows), projectionStrides);
         PipeBarrier<PIPE_V>();
-        WholeReduceSum(rowAcc_, product_, static_cast<int32_t>(kWidth),
-                       static_cast<int32_t>(kRows), 1, 1, 8);
+        RepeatReduceSum(rowAcc_, product_, static_cast<int32_t>(kRows),
+                        static_cast<int32_t>(kWidth), 0, 1, 1, 8);
         SyncVectorToScalar();
         const float meanWithEps = reduceOut_.GetValue(0) * invWidth_ + normEps_;
 

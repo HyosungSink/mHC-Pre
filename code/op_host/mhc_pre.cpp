@@ -224,15 +224,26 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     const uint32_t dtypeX = static_cast<uint32_t>(xType);
     const uint32_t dtypeParam = static_cast<uint32_t>(paramType);
-    const uint32_t fastSmall =
+    const bool fastN4D16 =
         shapeInfo.n == 4U && shapeInfo.d == 16U && shapeInfo.width == 64U &&
-        shapeInfo.rowCount == 24U ? 1U : 0U;
-    ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall);
-    const uint64_t fastSmallBlockCap = shapeInfo.positionCount <= 16U ? 4U : 16U;
-    const uint64_t availableBlocks =
-        fastSmall != 0U ? std::min<uint64_t>(coreCount, fastSmallBlockCap) : coreCount;
+        shapeInfo.rowCount == 24U;
+    const bool fastN8D16 =
+        shapeInfo.n == 8U && shapeInfo.d == 16U && shapeInfo.width == 128U &&
+        shapeInfo.rowCount == 80U;
+    const bool fastExactAttrs =
+        tensorGamma != nullptr && *attrNormEps == 1e-6F && *attrHcEps == 1e-6F;
+    const bool fastN4Exact =
+        fastN4D16 && shapeInfo.positionCount == 34U && fastExactAttrs;
+    const bool fastN8Exact =
+        fastN8D16 && shapeInfo.positionCount <= coreCount && fastExactAttrs;
+    const uint32_t fastSmall =
+        fastN4Exact ? 0U : (fastN4D16 || fastN8D16 ? 1U : 0U);
+    const uint32_t fastOnePosition = fastN4Exact || fastN8Exact ? 1U : 0U;
+    const uint64_t blockCap = fastN4Exact ? 16U : (fastN4D16 ? 12U : coreCount);
     const uint32_t blockDim = static_cast<uint32_t>(
-        std::min<uint64_t>(availableBlocks, shapeInfo.positionCount));
+        std::min<uint64_t>(std::min<uint64_t>(coreCount, blockCap),
+                           shapeInfo.positionCount));
+    ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition);
     if (context->SetBlockDim(blockDim) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }

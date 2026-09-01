@@ -5,7 +5,7 @@
 
 using namespace AscendC;
 
-template <class DT_X, class DT_PARAM>
+template <class DT_X, class DT_PARAM, uint32_t STATIC_N, bool ONE_POSITION>
 class KernelMhcPreSmallStatic {
 public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
@@ -37,54 +37,143 @@ public:
         hInAcc_ = LocalTensor<float>(TPosition::VECOUT, kHInAddress, kWidth);
         reduceOut_ = LocalTensor<float>(TPosition::VECCALC, kReduceAddress, 8U);
         scalarIn_ = LocalTensor<float>(TPosition::VECOUT, kScalarInAddress, 8U);
-        scalarOut_ = LocalTensor<float>(TPosition::VECCALC, kScalarOutAddress, 8U);
+        scalarOut_ = LocalTensor<float>(TPosition::VECOUT, kScalarOutAddress, kScalarLength);
         scalarAux_ = LocalTensor<float>(TPosition::VECCALC, kScalarAuxAddress, 8U);
-        rowAcc_ = LocalTensor<float>(TPosition::VECOUT, kRowAddress, 32U);
+        rowAcc_ = LocalTensor<float>(TPosition::VECOUT, kRowAddress, kRowLength);
+        gatherOffsets_ = LocalTensor<uint32_t>(TPosition::VECCALC, kGatherAddress, 64U);
         xOutRaw_ = LocalTensor<DT_X>(TPosition::VECOUT, kXOutAddress, 16U);
-        paramOutRaw_ = LocalTensor<DT_PARAM>(TPosition::VECOUT, kParamOutAddress, 32U);
+        paramOutRaw_ = LocalTensor<DT_PARAM>(TPosition::VECOUT, kParamOutAddress,
+                                             kParamOutLength);
+    }
+
+    __aicore__ inline void InitN4Exact(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha,
+                                       GM_ADDR bias, GM_ADDR gamma, GM_ADDR hIn,
+                                       GM_ADDR hPost, GM_ADDR hRes)
+    {
+        MhcPreTilingData tiling;
+        tiling.positionCount = 34U;
+        tiling.hasGamma = 1U;
+        tiling.invWidth = 0.015625F;
+        tiling.normEps = 1e-6F;
+        tiling.hcEps = 1e-6F;
+        Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tiling);
+    }
+
+    __aicore__ inline void InitOnePosition(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha,
+                                           GM_ADDR bias, GM_ADDR gamma, GM_ADDR hIn,
+                                           GM_ADDR hPost, GM_ADDR hRes)
+    {
+        hasGamma_ = true;
+        invWidth_ = 0.0078125F;
+        normEps_ = 1e-6F;
+        hcEps_ = 1e-6F;
+
+        xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x));
+        phiGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(phi));
+        alphaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(alpha));
+        biasGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(bias));
+        gammaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(gamma));
+        hInGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(hIn));
+        hPostGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(hPost));
+        hResGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(hRes));
+
+        if constexpr (!IsSameType<DT_X, float>::value) {
+            xRaw_ = LocalTensor<DT_X>(TPosition::VECIN, kXRawAddress, kWidth);
+        }
+        if constexpr (!IsSameType<DT_PARAM, float>::value) {
+            paramRaw_ = LocalTensor<DT_PARAM>(TPosition::VECIN, kParamRawAddress,
+                                              kParamLength);
+        }
+        xFloat_ = LocalTensor<float>(TPosition::VECIN, kXFloatAddress, kWidth);
+        paramFloat_ = LocalTensor<float>(TPosition::VECIN, kParamFloatAddress,
+                                         kParamLength);
+        product_ = LocalTensor<float>(TPosition::VECCALC, kProductAddress,
+                                      kProductLength);
+        hInAcc_ = LocalTensor<float>(TPosition::VECOUT, kHInAddress, kWidth);
+        reduceOut_ = LocalTensor<float>(TPosition::VECCALC, kReduceAddress, 8U);
+        scalarOut_ = LocalTensor<float>(TPosition::VECOUT, kScalarOutAddress,
+                                        kScalarLength);
+        rowAcc_ = LocalTensor<float>(TPosition::VECOUT, kRowAddress, kRowLength);
+        if constexpr (!IsSameType<DT_X, float>::value) {
+            xOutRaw_ = LocalTensor<DT_X>(TPosition::VECOUT, kXOutAddress, 16U);
+        }
+        if constexpr (!IsSameType<DT_PARAM, float>::value) {
+            paramOutRaw_ = LocalTensor<DT_PARAM>(TPosition::VECOUT, kParamOutAddress,
+                                                 kParamOutLength);
+        }
     }
 
     __aicore__ inline void Process()
     {
         LoadConstants();
-        const uint32_t blockIndex = GetBlockIdx();
-        const uint32_t blockCount = GetBlockNum();
-        bool waitsForPreviousStore = false;
-        for (uint64_t position = blockIndex; position < positionCount_; position += blockCount) {
-            if constexpr (IsSameType<DT_X, float>::value) {
+        if constexpr (ONE_POSITION) {
+            const uint64_t position = GetBlockIdx();
+            LoadX(position * kWidth);
+            SetVectorMask<float>(64);
+            SyncMte2ToVector();
+            if constexpr (!IsSameType<DT_X, float>::value) {
+                Cast<float, DT_X, false>(xFloat_, xRaw_, RoundMode::CAST_NONE,
+                                         MASK_PLACEHOLDER, 2U, {1, 1, 8, 4});
+                StaticVectorBarrier();
+            }
+            ProjectAndInvRms();
+            Transform();
+            if constexpr (IsSameType<DT_PARAM, float>::value) {
+                SyncVectorToMte3();
+                StoreParamOutputs(position);
+                ComputeHIn();
+                SyncVectorToMte3();
+                StoreHInOutput(position);
+            } else {
+                ComputeHIn();
+                StoreOutputs(position);
+            }
+            ResetMask();
+        } else {
+            const uint32_t blockIndex = GetBlockIdx();
+            const uint32_t blockCount = GetBlockNum();
+            bool waitsForPreviousStore = false;
+            for (uint64_t position = blockIndex; position < positionCount_;
+                 position += blockCount) {
+                const bool hasNextPosition = position + blockCount < positionCount_;
                 if (position != blockIndex) {
                     WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
                 }
-            }
-            LoadX(position * kWidth);
-            if (waitsForPreviousStore) {
-                WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            }
-            SyncMte2ToVector();
-            if constexpr (!IsSameType<DT_X, float>::value) {
-                Cast(xFloat_, xRaw_, RoundMode::CAST_NONE, kWidth);
-                PipeBarrier<PIPE_V>();
-            }
+                LoadX(position * kWidth);
+                if constexpr (kN != 4U || IsSameType<DT_X, float>::value) {
+                    if (waitsForPreviousStore) {
+                        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                    }
+                }
+                SetVectorMask<float>(64);
+                SyncMte2ToVector();
+                if constexpr (!IsSameType<DT_X, float>::value) {
+                    Cast<float, DT_X, false>(xFloat_, xRaw_, RoundMode::CAST_NONE,
+                                             MASK_PLACEHOLDER,
+                                             static_cast<uint8_t>(kWidth / 64U),
+                                             {1, 1, 8, 4});
+                    StaticVectorBarrier();
+                    if (hasNextPosition) {
+                        SetFlag<HardEvent::V_MTE2>(EVENT_ID1);
+                    }
+                }
 
-            const float invRms = ProjectAndInvRms();
-            float hPre0;
-            float hPre1;
-            float hPre2;
-            float hPre3;
-            Transform(invRms, hPre0, hPre1, hPre2, hPre3);
-            ComputeHIn(hPre0, hPre1, hPre2, hPre3);
-            const bool hasNextPosition = position + blockCount < positionCount_;
-            if constexpr (IsSameType<DT_X, float>::value) {
-                if (hasNextPosition) {
-                    SetFlag<HardEvent::V_MTE2>(EVENT_ID1);
+                ProjectAndInvRms(waitsForPreviousStore);
+                Transform();
+                ComputeHIn();
+                if constexpr (IsSameType<DT_X, float>::value) {
+                    if (hasNextPosition) {
+                        SetFlag<HardEvent::V_MTE2>(EVENT_ID1);
+                    }
+                }
+                StoreOutputs(position);
+
+                waitsForPreviousStore = hasNextPosition;
+                if (waitsForPreviousStore) {
+                    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
                 }
             }
-            StoreOutputs(position);
-
-            waitsForPreviousStore = hasNextPosition;
-            if (waitsForPreviousStore) {
-                SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            }
+            ResetMask();
         }
     }
 
@@ -94,13 +183,28 @@ private:
         return (value + 31U) & ~31U;
     }
 
-    static constexpr uint32_t kWidth = 64U;
-    static constexpr uint32_t kRows = 24U;
-    static constexpr uint32_t kProductLength = kWidth * kRows;
-    static constexpr uint32_t kBiasOffset = kProductLength;
-    static constexpr uint32_t kAlphaOffset = 1568U;
-    static constexpr uint32_t kGammaOffset = 1584U;
-    static constexpr uint32_t kParamLength = 1648U;
+    __aicore__ inline void StaticVectorBarrier()
+    {
+    }
+
+    static_assert(STATIC_N == 4U || STATIC_N == 8U);
+    static_assert(!ONE_POSITION || STATIC_N == 8U);
+    static constexpr uint32_t kN = STATIC_N;
+    static constexpr bool kDirectAlpha =
+        ONE_POSITION && IsSameType<DT_PARAM, float>::value;
+    static constexpr uint32_t kD = 16U;
+    static constexpr uint32_t kWidth = kN * kD;
+    static constexpr uint32_t kRows = kN * (kN + 2U);
+    static constexpr uint32_t kPhiLength = kWidth * kRows;
+    static constexpr uint32_t kProductLength =
+        kN == 4U ? kPhiLength : 64U * kRows;
+    static constexpr uint32_t kBiasOffset = kPhiLength;
+    static constexpr uint32_t kAlphaOffset = kN == 4U ? 1568U : 10320U;
+    static constexpr uint32_t kGammaOffset = kN == 4U ? 1584U : 10336U;
+    static constexpr uint32_t kParamLength = kGammaOffset + kWidth;
+    static constexpr uint32_t kScalarLength = kN == 4U ? 8U : 16U;
+    static constexpr uint32_t kRowLength = kN == 4U ? 32U : 80U;
+    static constexpr uint32_t kParamOutLength = kN == 4U ? 32U : 80U;
 
     static constexpr uint32_t kXRawAddress = 0U;
     static constexpr uint32_t kParamRawAddress =
@@ -120,9 +224,11 @@ private:
     static constexpr uint32_t kScalarAuxAddress = kScalarOutAddress + 32U;
     static constexpr uint32_t kRowAddress = kScalarAuxAddress + 32U;
     static constexpr uint32_t kXOutAddress =
-        Align32(kRowAddress + 32U * sizeof(float));
+        Align32(kRowAddress + kRowLength * sizeof(float));
     static constexpr uint32_t kParamOutAddress =
         Align32(kXOutAddress + 16U * sizeof(DT_X));
+    static constexpr uint32_t kGatherAddress =
+        Align32(kParamOutAddress + kParamOutLength * sizeof(DT_PARAM));
 
     __aicore__ inline void SyncMte2ToVector()
     {
@@ -142,43 +248,102 @@ private:
         WaitFlag<HardEvent::S_V>(EVENT_ID0);
     }
 
+    __aicore__ inline void SyncVectorToMte3()
+    {
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    }
+
     __aicore__ inline void LoadConstants()
     {
-        const DataCopyExtParams phiCopy{1, kProductLength * sizeof(DT_PARAM), 0, 0, 0};
+        const DataCopyExtParams phiCopy{1, kPhiLength * sizeof(DT_PARAM), 0, 0, 0};
         const DataCopyExtParams biasCopy{1, kRows * sizeof(DT_PARAM), 0, 0, 0};
         const DataCopyExtParams alphaCopy{1, 3U * sizeof(DT_PARAM), 0, 0, 0};
         const DataCopyExtParams gammaCopy{1, kWidth * sizeof(DT_PARAM), 0, 0, 0};
         if constexpr (IsSameType<DT_PARAM, float>::value) {
             DataCopyPad(paramFloat_, phiGm_, phiCopy, {});
             DataCopyPad(paramFloat_[kBiasOffset], biasGm_, biasCopy, {});
-            DataCopyPad(paramFloat_[kAlphaOffset], alphaGm_, alphaCopy, {});
-            if (hasGamma_) {
+            if constexpr (!kDirectAlpha) {
+                DataCopyPad(paramFloat_[kAlphaOffset], alphaGm_, alphaCopy, {});
+            }
+            if constexpr (ONE_POSITION) {
+                DataCopyPad(paramFloat_[kGammaOffset], gammaGm_, gammaCopy, {});
+            } else if (hasGamma_) {
                 DataCopyPad(paramFloat_[kGammaOffset], gammaGm_, gammaCopy, {});
             }
         } else {
             DataCopyPad(paramRaw_, phiGm_, phiCopy, {});
             DataCopyPad(paramRaw_[kBiasOffset], biasGm_, biasCopy, {});
             DataCopyPad(paramRaw_[kAlphaOffset], alphaGm_, alphaCopy, {});
-            if (hasGamma_) {
+            if constexpr (ONE_POSITION) {
+                DataCopyPad(paramRaw_[kGammaOffset], gammaGm_, gammaCopy, {});
+            } else if (hasGamma_) {
                 DataCopyPad(paramRaw_[kGammaOffset], gammaGm_, gammaCopy, {});
             }
+        }
+        if constexpr (kDirectAlpha) {
+            alpha0_ = alphaGm_.GetValue(0U);
+            alpha1_ = alphaGm_.GetValue(1U);
+            alpha2_ = alphaGm_.GetValue(2U);
         }
         SyncMte2ToVector();
         if constexpr (!IsSameType<DT_PARAM, float>::value) {
             Cast(paramFloat_, paramRaw_, RoundMode::CAST_NONE, kParamLength);
-            PipeBarrier<PIPE_V>();
+            StaticVectorBarrier();
         }
 
-        if (hasGamma_) {
-            const BinaryRepeatParams scaleStrides{1, 1, 1, 8, 0, 8};
-            Mul(paramFloat_, paramFloat_[kGammaOffset], paramFloat_,
-                static_cast<uint64_t>(kWidth), static_cast<uint8_t>(kRows), scaleStrides);
-            PipeBarrier<PIPE_V>();
+        if constexpr (kN == 4U) {
+            if (hasGamma_) {
+                const BinaryRepeatParams scaleStrides{1, 1, 1, 8, 0, 8};
+                Mul(paramFloat_, paramFloat_[kGammaOffset], paramFloat_,
+                    static_cast<uint64_t>(kWidth), static_cast<uint8_t>(kRows),
+                    scaleStrides);
+                StaticVectorBarrier();
+            }
         }
-        SyncVectorToScalar();
-        alpha0_ = paramFloat_.GetValue(kAlphaOffset);
-        alpha1_ = paramFloat_.GetValue(kAlphaOffset + 1U);
-        alpha2_ = paramFloat_.GetValue(kAlphaOffset + 2U);
+        if constexpr (!kDirectAlpha) {
+            SyncVectorToScalar();
+            alpha0_ = paramFloat_.GetValue(kAlphaOffset);
+            alpha1_ = paramFloat_.GetValue(kAlphaOffset + 1U);
+            alpha2_ = paramFloat_.GetValue(kAlphaOffset + 2U);
+        }
+        if constexpr (kN == 4U) {
+#pragma unroll
+            for (uint32_t index = 0; index < 4U; ++index) {
+                gatherOffsets_.SetValue(index, (4U + index) * sizeof(float));
+                gatherOffsets_.SetValue(4U + index, (4U + index) * sizeof(float));
+            }
+        }
+        if constexpr (!kDirectAlpha) {
+            SyncScalarToVector();
+        }
+        if constexpr (kN == 4U) {
+            Duplicate(gatherOffsets_[8U], 0U, 56U);
+        }
+        Duplicate(reduceOut_, 0.0F, 8U);
+        SetMaskNorm();
+        if constexpr (!ONE_POSITION) {
+            SetVectorMask<float>(64);
+            const UnaryRepeatParams contiguousUnary{1, 1, 8, 8};
+            Muls<float, false>(paramFloat_, paramFloat_, -alpha0_,
+                               MASK_PLACEHOLDER,
+                               static_cast<uint8_t>(kN * kWidth / 64U),
+                               contiguousUnary);
+            Muls<float, false>(paramFloat_[kN * kWidth],
+                               paramFloat_[kN * kWidth], -alpha1_,
+                               MASK_PLACEHOLDER,
+                               static_cast<uint8_t>(kN * kWidth / 64U),
+                               contiguousUnary);
+            Muls<float, false>(paramFloat_[2U * kN * kWidth],
+                               paramFloat_[2U * kN * kWidth], alpha2_,
+                               MASK_PLACEHOLDER,
+                               static_cast<uint8_t>(kN * kN * kWidth / 64U),
+                               contiguousUnary);
+        }
+        SetVectorMask<float>(static_cast<int32_t>(2U * kN));
+        Muls<float, false>(paramFloat_[kBiasOffset], paramFloat_[kBiasOffset],
+                           -1.0F, 1U);
+        StaticVectorBarrier();
     }
 
     __aicore__ inline void LoadX(uint64_t offset)
@@ -191,119 +356,232 @@ private:
         }
     }
 
-    __aicore__ inline float ProjectAndInvRms()
+    __aicore__ inline void ProjectAndInvRms(bool waitsForPreviousStore = false)
     {
-        Mul(product_, xFloat_, xFloat_, kWidth);
-        PipeBarrier<PIPE_V>();
-        RepeatReduceSum(reduceOut_, product_, 1, static_cast<int32_t>(kWidth),
-                        0, 1, 1, 8);
+        const BinaryRepeatParams contiguousBinary{1, 1, 1, 8, 8, 8};
+        const UnaryRepeatParams contiguousUnary{1, 1, 8, 8};
+        if constexpr (kN == 4U) {
+            Mul<float, false>(product_, xFloat_, xFloat_, MASK_PLACEHOLDER, 1U,
+                              contiguousBinary);
+            StaticVectorBarrier();
+            RepeatReduceSum<float, false>(reduceOut_, product_, 1, MASK_PLACEHOLDER,
+                                          0, 1, 1, 0);
 
-        const BinaryRepeatParams projectionStrides{1, 1, 1, 8, 0, 8};
-        Mul(product_, xFloat_, paramFloat_, static_cast<uint64_t>(kWidth),
-            static_cast<uint8_t>(kRows), projectionStrides);
-        PipeBarrier<PIPE_V>();
-        RepeatReduceSum(rowAcc_, product_, static_cast<int32_t>(kRows),
-                        static_cast<int32_t>(kWidth), 0, 1, 1, 8);
-        SyncVectorToScalar();
-        const float meanWithEps = reduceOut_.GetValue(0) * invWidth_ + normEps_;
+            const BinaryRepeatParams projectionStrides{1, 1, 1, 8, 0, 8};
+            Mul<float, false>(product_, xFloat_, paramFloat_, MASK_PLACEHOLDER,
+                              static_cast<uint8_t>(kRows), projectionStrides);
+            StaticVectorBarrier();
+            if constexpr (!IsSameType<DT_X, float>::value) {
+                if (waitsForPreviousStore) {
+                    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                }
+            }
+            RepeatReduceSum<float, false>(rowAcc_, product_,
+                                          static_cast<int32_t>(kRows),
+                                          MASK_PLACEHOLDER, 0, 1, 1, 8);
+        } else {
+            Mul<float, false>(product_, xFloat_, xFloat_, MASK_PLACEHOLDER, 1U,
+                              contiguousBinary);
+            StaticVectorBarrier();
+            MulAddDst<float, float, false>(product_, xFloat_[64U], xFloat_[64U],
+                                           MASK_PLACEHOLDER, 1U, contiguousBinary);
+            StaticVectorBarrier();
+            RepeatReduceSum<float, false>(reduceOut_, product_, 1, MASK_PLACEHOLDER,
+                                          0, 1, 1, 0);
 
-        Duplicate(scalarIn_, meanWithEps, 8U);
-        PipeBarrier<PIPE_V>();
-        Rsqrt(scalarOut_, scalarIn_, 8U);
-        SyncVectorToScalar();
-        return scalarOut_.GetValue(0);
+            const BinaryRepeatParams projectionHalfStrides{1, 1, 1, 8, 0, 16};
+            if (ONE_POSITION || hasGamma_) {
+                Mul<float, false>(hInAcc_, xFloat_, paramFloat_[kGammaOffset],
+                                  MASK_PLACEHOLDER, 2U, contiguousBinary);
+                StaticVectorBarrier();
+                Mul<float, false>(product_, hInAcc_, paramFloat_, MASK_PLACEHOLDER,
+                                  static_cast<uint8_t>(kRows),
+                                  projectionHalfStrides);
+                StaticVectorBarrier();
+                MulAddDst<float, float, false>(product_, hInAcc_[64U],
+                                               paramFloat_[64U], MASK_PLACEHOLDER,
+                                               static_cast<uint8_t>(kRows),
+                                               projectionHalfStrides);
+            } else {
+                Mul<float, false>(product_, xFloat_, paramFloat_, MASK_PLACEHOLDER,
+                                  static_cast<uint8_t>(kRows),
+                                  projectionHalfStrides);
+                StaticVectorBarrier();
+                MulAddDst<float, float, false>(product_, xFloat_[64U],
+                                               paramFloat_[64U], MASK_PLACEHOLDER,
+                                               static_cast<uint8_t>(kRows),
+                                               projectionHalfStrides);
+            }
+            StaticVectorBarrier();
+            RepeatReduceSum<float, false>(rowAcc_, product_,
+                                          static_cast<int32_t>(kRows),
+                                          MASK_PLACEHOLDER, 0, 1, 1, 8);
+        }
+        SetVectorMask<float>(1);
+        Muls<float, false>(reduceOut_, reduceOut_, invWidth_, 1U);
+        StaticVectorBarrier();
+        Adds<float, false>(reduceOut_, reduceOut_, normEps_, 1U);
+        StaticVectorBarrier();
+        Rsqrt<float, false>(reduceOut_, reduceOut_, MASK_PLACEHOLDER, 1U,
+                            contiguousUnary);
     }
 
-    __aicore__ inline void Transform(float invRms, float &hPre0, float &hPre1,
-                                      float &hPre2, float &hPre3)
+    __aicore__ inline void Transform()
     {
-#pragma unroll
-        for (uint32_t index = 0; index < 4U; ++index) {
-            scalarAux_.SetValue(index, invRms * alpha0_);
-            scalarAux_.SetValue(4U + index, invRms * alpha1_);
+        StaticVectorBarrier();
+        Brcb(product_, reduceOut_, 1U, {1, 8});
+        StaticVectorBarrier();
+        SetVectorMask<float>(8);
+        const BinaryRepeatParams normalizeStrides{1, 1, 1, 1, 1, 0};
+        const UnaryRepeatParams contiguousUnary{1, 1, 8, 8};
+        Mul<float, false>(rowAcc_, rowAcc_, product_, MASK_PLACEHOLDER,
+                          static_cast<uint8_t>(kRows / 8U), normalizeStrides);
+        StaticVectorBarrier();
+        if constexpr (ONE_POSITION) {
+            SetVectorMask<float>(static_cast<int32_t>(kN));
+            Muls<float, false>(rowAcc_, rowAcc_, -alpha0_, MASK_PLACEHOLDER, 1U,
+                               contiguousUnary);
+            Muls<float, false>(rowAcc_[kN], rowAcc_[kN], -alpha1_,
+                               MASK_PLACEHOLDER, 1U, contiguousUnary);
+            SetVectorMask<float>(static_cast<int32_t>(kN * kN));
+            Muls<float, false>(rowAcc_[2U * kN], rowAcc_[2U * kN], alpha2_,
+                               MASK_PLACEHOLDER, 1U, contiguousUnary);
+            StaticVectorBarrier();
         }
-        SyncScalarToVector();
-        Mul(rowAcc_, rowAcc_, scalarAux_, 8U);
-        Muls(rowAcc_[8U], rowAcc_[8U], invRms * alpha2_, 16U);
-        PipeBarrier<PIPE_V>();
-        Add(rowAcc_, rowAcc_, paramFloat_[kBiasOffset], kRows);
-        PipeBarrier<PIPE_V>();
-
-        Muls(scalarOut_, rowAcc_, -1.0F, 8U);
-        PipeBarrier<PIPE_V>();
-        Exp(scalarOut_, scalarOut_, 8U);
-        PipeBarrier<PIPE_V>();
-        Adds(scalarOut_, scalarOut_, 1.0F, 8U);
-        Duplicate(scalarAux_, 1.0F, 8U);
-        PipeBarrier<PIPE_V>();
-        Div(rowAcc_, scalarAux_, scalarOut_, 8U);
-        PipeBarrier<PIPE_V>();
-        Adds(rowAcc_, rowAcc_, hcEps_, 4U);
-        SyncVectorToScalar();
-
-#pragma unroll
-        for (uint32_t index = 0; index < 4U; ++index) {
-            scalarAux_.SetValue(index, 1.0F);
-            scalarAux_.SetValue(4U + index, 2.0F);
+        if constexpr (kN == 4U) {
+            SetVectorMask<float>(static_cast<int32_t>(kRows));
+            const BinaryRepeatParams contiguousBinary{1, 1, 1, 8, 8, 8};
+            Add<float, false>(rowAcc_, rowAcc_, paramFloat_[kBiasOffset],
+                              MASK_PLACEHOLDER, 1U, contiguousBinary);
+        } else {
+            SetVectorMask<float>(16);
+            const BinaryRepeatParams contiguousRows{1, 1, 1, 2, 2, 2};
+            Add<float, false>(rowAcc_, rowAcc_, paramFloat_[kBiasOffset],
+                              MASK_PLACEHOLDER, 5U, contiguousRows);
         }
-        SyncScalarToVector();
-        Mul(rowAcc_, rowAcc_, scalarAux_, 8U);
-        SyncVectorToScalar();
+        StaticVectorBarrier();
 
-        hPre0 = rowAcc_.GetValue(0);
-        hPre1 = rowAcc_.GetValue(1);
-        hPre2 = rowAcc_.GetValue(2);
-        hPre3 = rowAcc_.GetValue(3);
-#pragma unroll
-        for (uint32_t index = 0; index < 4U; ++index) {
-            scalarIn_.SetValue(index, rowAcc_.GetValue(4U + index));
+        SetVectorMask<float>(static_cast<int32_t>(2U * kN));
+        Exp<float, false>(scalarOut_, rowAcc_, MASK_PLACEHOLDER, 1U,
+                          contiguousUnary);
+        StaticVectorBarrier();
+        Adds<float, false>(scalarOut_, scalarOut_, 1.0F, 1U);
+        StaticVectorBarrier();
+        Reciprocal<float, false>(rowAcc_, scalarOut_, MASK_PLACEHOLDER, 1U,
+                                 contiguousUnary);
+        StaticVectorBarrier();
+        SetVectorMask<float>(static_cast<int32_t>(kN));
+        Adds<float, false>(rowAcc_, rowAcc_, hcEps_, 1U);
+        StaticVectorBarrier();
+        if constexpr (kN == 4U) {
+            Gather(scalarOut_, rowAcc_, gatherOffsets_, 0U, 4U);
+            StaticVectorBarrier();
+            Muls<float, false>(scalarOut_, scalarOut_, 2.0F, 1U);
+        } else {
+            Muls<float, false>(rowAcc_[kN], rowAcc_[kN], 2.0F, 1U);
         }
     }
 
-    __aicore__ inline void ComputeHIn(float hPre0, float hPre1, float hPre2, float hPre3)
+    __aicore__ inline void ComputeHIn()
     {
-        SyncScalarToVector();
-        Muls(hInAcc_, xFloat_, hPre0, 16U);
-        Muls(product_, xFloat_[16U], hPre1, 16U);
-        PipeBarrier<PIPE_V>();
-        Add(hInAcc_, hInAcc_, product_, 16U);
-        PipeBarrier<PIPE_V>();
-        Muls(product_, xFloat_[32U], hPre2, 16U);
-        PipeBarrier<PIPE_V>();
-        Add(hInAcc_, hInAcc_, product_, 16U);
-        PipeBarrier<PIPE_V>();
-        Muls(product_, xFloat_[48U], hPre3, 16U);
-        PipeBarrier<PIPE_V>();
-        Add(hInAcc_, hInAcc_, product_, 16U);
+        StaticVectorBarrier();
+        Brcb(product_, rowAcc_, 1U, {1, 8});
+        StaticVectorBarrier();
+        SetVectorMask<float>(8);
+        const BinaryRepeatParams laneWeightStrides{1, 1, 1, 1, 1, 0};
+        Mul<float, false>(hInAcc_, xFloat_, product_, MASK_PLACEHOLDER, 2U,
+                          laneWeightStrides);
+        StaticVectorBarrier();
+        MulAddDst<float, float, false>(hInAcc_, xFloat_[16U], product_[8U],
+                                      MASK_PLACEHOLDER, 2U, laneWeightStrides);
+        StaticVectorBarrier();
+        MulAddDst<float, float, false>(hInAcc_, xFloat_[32U], product_[16U],
+                                      MASK_PLACEHOLDER, 2U, laneWeightStrides);
+        StaticVectorBarrier();
+        MulAddDst<float, float, false>(hInAcc_, xFloat_[48U], product_[24U],
+                                      MASK_PLACEHOLDER, 2U, laneWeightStrides);
+        if constexpr (kN == 8U) {
+            StaticVectorBarrier();
+            MulAddDst<float, float, false>(hInAcc_, xFloat_[64U], product_[32U],
+                                           MASK_PLACEHOLDER, 2U,
+                                           laneWeightStrides);
+            StaticVectorBarrier();
+            MulAddDst<float, float, false>(hInAcc_, xFloat_[80U], product_[40U],
+                                           MASK_PLACEHOLDER, 2U,
+                                           laneWeightStrides);
+            StaticVectorBarrier();
+            MulAddDst<float, float, false>(hInAcc_, xFloat_[96U], product_[48U],
+                                           MASK_PLACEHOLDER, 2U,
+                                           laneWeightStrides);
+            StaticVectorBarrier();
+            MulAddDst<float, float, false>(hInAcc_, xFloat_[112U], product_[56U],
+                                           MASK_PLACEHOLDER, 2U,
+                                           laneWeightStrides);
+        }
 
         if constexpr (!IsSameType<DT_PARAM, float>::value) {
-            Cast(paramOutRaw_, scalarIn_, RoundMode::CAST_RINT, 4U);
-            Cast(paramOutRaw_[16U], rowAcc_[8U], RoundMode::CAST_RINT, 16U);
+            if constexpr (kN == 4U) {
+                SetVectorMask<float>(4);
+                Cast<DT_PARAM, float, false>(paramOutRaw_, scalarOut_,
+                                             RoundMode::CAST_RINT, MASK_PLACEHOLDER,
+                                             1U, {1, 1, 4, 8});
+                SetVectorMask<float>(16);
+                Cast<DT_PARAM, float, false>(paramOutRaw_[16U], rowAcc_[8U],
+                                             RoundMode::CAST_RINT, MASK_PLACEHOLDER,
+                                             1U, {1, 1, 4, 8});
+            } else {
+                SetVectorMask<float>(8);
+                Cast<DT_PARAM, float, false>(paramOutRaw_, rowAcc_[kN],
+                                             RoundMode::CAST_RINT, MASK_PLACEHOLDER,
+                                             1U, {1, 1, 4, 8});
+                SetVectorMask<float>(64);
+                Cast<DT_PARAM, float, false>(paramOutRaw_[16U], rowAcc_[2U * kN],
+                                             RoundMode::CAST_RINT, MASK_PLACEHOLDER,
+                                             1U, {1, 1, 4, 8});
+            }
         }
         if constexpr (!IsSameType<DT_X, float>::value) {
-            Cast(xOutRaw_, hInAcc_, RoundMode::CAST_RINT, 16U);
+            SetVectorMask<float>(16);
+            Cast<DT_X, float, false>(xOutRaw_, hInAcc_, RoundMode::CAST_RINT,
+                                     MASK_PLACEHOLDER, 1U, {1, 1, 4, 8});
         }
     }
 
-    __aicore__ inline void StoreOutputs(uint64_t position)
+    __aicore__ inline void StoreParamOutputs(uint64_t position)
     {
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        const DataCopyExtParams postCopy{1, 4U * sizeof(DT_PARAM), 0, 0, 0};
-        const DataCopyExtParams resCopy{1, 16U * sizeof(DT_PARAM), 0, 0, 0};
-        const DataCopyExtParams hInCopy{1, 16U * sizeof(DT_X), 0, 0, 0};
+        const DataCopyExtParams postCopy{1, kN * sizeof(DT_PARAM), 0, 0, 0};
+        const DataCopyExtParams resCopy{1, kN * kN * sizeof(DT_PARAM), 0, 0, 0};
         if constexpr (IsSameType<DT_PARAM, float>::value) {
-            DataCopyPad(hPostGm_[position * 4U], scalarIn_, postCopy);
-            DataCopyPad(hResGm_[position * 16U], rowAcc_[8U], resCopy);
+            if constexpr (kN == 4U) {
+                DataCopyPad(hPostGm_[position * kN], scalarOut_, postCopy);
+                DataCopyPad(hResGm_[position * kN * kN], rowAcc_[2U * kN],
+                            resCopy);
+            } else {
+                DataCopyPad(hPostGm_[position * kN], rowAcc_[kN], postCopy);
+                DataCopyPad(hResGm_[position * kN * kN], rowAcc_[2U * kN],
+                            resCopy);
+            }
         } else {
-            DataCopyPad(hPostGm_[position * 4U], paramOutRaw_, postCopy);
-            DataCopyPad(hResGm_[position * 16U], paramOutRaw_[16U], resCopy);
+            DataCopyPad(hPostGm_[position * kN], paramOutRaw_, postCopy);
+            DataCopyPad(hResGm_[position * kN * kN], paramOutRaw_[16U], resCopy);
         }
+    }
+
+    __aicore__ inline void StoreHInOutput(uint64_t position)
+    {
+        const DataCopyExtParams hInCopy{1, 16U * sizeof(DT_X), 0, 0, 0};
         if constexpr (IsSameType<DT_X, float>::value) {
             DataCopyPad(hInGm_[position * 16U], hInAcc_, hInCopy);
         } else {
             DataCopyPad(hInGm_[position * 16U], xOutRaw_, hInCopy);
         }
+    }
+
+    __aicore__ inline void StoreOutputs(uint64_t position)
+    {
+        SyncVectorToMte3();
+        StoreParamOutputs(position);
+        StoreHInOutput(position);
     }
 
 private:
@@ -327,6 +605,7 @@ private:
     LocalTensor<float> scalarOut_;
     LocalTensor<float> scalarAux_;
     LocalTensor<float> rowAcc_;
+    LocalTensor<uint32_t> gatherOffsets_;
     LocalTensor<DT_X> xOutRaw_;
     LocalTensor<DT_PARAM> paramOutRaw_;
 
@@ -730,18 +1009,36 @@ private:
     float alpha2_ = 0.0F;
 };
 
-template <typename DT_X, typename DT_PARAM, int FAST_SMALL>
+template <typename DT_X, typename DT_PARAM, int FAST_SMALL, int FAST_ONE_POSITION>
 __global__ __aicore__ void mhc_pre(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
                                    GM_ADDR gamma, GM_ADDR hIn, GM_ADDR hPost, GM_ADDR hRes,
                                    GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(MhcPreTilingData);
-    if constexpr (FAST_SMALL != 0) {
+    if constexpr (FAST_ONE_POSITION != 0) {
+        InitSocState();
+        if constexpr (FAST_SMALL != 0) {
+            KernelMhcPreSmallStatic<DT_X, DT_PARAM, 8U, true> op;
+            op.InitOnePosition(x, phi, alpha, bias, gamma, hIn, hPost, hRes);
+            op.Process();
+        } else {
+            KernelMhcPreSmallStatic<DT_X, DT_PARAM, 4U, false> op;
+            op.InitN4Exact(x, phi, alpha, bias, gamma, hIn, hPost, hRes);
+            op.Process();
+        }
+        PipeBarrier<PIPE_ALL>();
+    } else if constexpr (FAST_SMALL != 0) {
         InitSocState();
         GET_TILING_DATA_WITH_STRUCT(MhcPreTilingData, tilingData, tiling);
-        KernelMhcPreSmallStatic<DT_X, DT_PARAM> op;
-        op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tilingData);
-        op.Process();
+        if (tilingData.n == 4U) {
+            KernelMhcPreSmallStatic<DT_X, DT_PARAM, 4U, false> op;
+            op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tilingData);
+            op.Process();
+        } else {
+            KernelMhcPreSmallStatic<DT_X, DT_PARAM, 8U, false> op;
+            op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tilingData);
+            op.Process();
+        }
         PipeBarrier<PIPE_ALL>();
     } else {
         GET_TILING_DATA_WITH_STRUCT(MhcPreTilingData, tilingData, tiling);

@@ -8,21 +8,32 @@ using namespace AscendC;
 // 静态形状快速路径：D=16 且 n 为 4/8 时展开为编译期常量，
 // 行缓冲按 32 字节分组排布，使 pPre/pPost/pRes 三段全部对齐，
 // 从而避免 Gather 与标量-向量往返同步。
-template <class DT_X, class DT_PARAM, uint32_t STATIC_N, bool ONE_POSITION>
+template <class DT_X, class DT_PARAM, uint32_t STATIC_N, bool ONE_POSITION,
+          bool EPS_DEFAULT>
 class KernelMhcPreSmallStatic {
 public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
                                 GM_ADDR gamma, GM_ADDR hIn, GM_ADDR hPost, GM_ADDR hRes,
                                 GM_ADDR tiling)
     {
-        // 只取真正随输入变化的三个字段，n/D/invWidth 由模板在编译期定下。
-        // 整体拷贝 Tiling 结构体会在核起始处引入一次阻塞的冷 GM 读取。
-        __gm__ MhcPreTilingData *tilingPtr =
-            reinterpret_cast<__gm__ MhcPreTilingData *>(tiling);
-        positionCount_ = tilingPtr->positionCount;
-        hasGamma_ = tilingPtr->hasGamma != 0;
-        normEps_ = tilingPtr->normEps;
-        hcEps_ = tilingPtr->hcEps;
+        // n/D/invWidth 由模板定下，gamma 由可选输入指针判定，eps 常见取值走 TilingKey：
+        // 单位置 + 默认 eps 时本路径完全不访问 Tiling 缓冲，省掉核起始处的冷 GM 读取。
+        hasGamma_ = gamma != nullptr;
+        if constexpr (EPS_DEFAULT) {
+            normEps_ = kDefaultEps;
+            hcEps_ = kDefaultEps;
+        }
+        if constexpr (!EPS_DEFAULT || !ONE_POSITION) {
+            __gm__ MhcPreTilingData *tilingPtr =
+                reinterpret_cast<__gm__ MhcPreTilingData *>(tiling);
+            if constexpr (!ONE_POSITION) {
+                positionCount_ = tilingPtr->positionCount;
+            }
+            if constexpr (!EPS_DEFAULT) {
+                normEps_ = tilingPtr->normEps;
+                hcEps_ = tilingPtr->hcEps;
+            }
+        }
 
         xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x));
         phiGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(phi));
@@ -88,6 +99,7 @@ private:
     static constexpr uint32_t kWidthRepeats = kWidth / 64U;
     static constexpr uint32_t kProductLength = 64U * kRows;
     static constexpr float kInvWidth = 1.0F / static_cast<float>(kWidth);
+    static constexpr float kDefaultEps = 1e-6F;
     // 行缓冲分组偏移：三段起点均为 32 字节整数倍，n=8 时恰好连续。
     static constexpr uint32_t kPostLocal = 8U;
     static constexpr uint32_t kResLocal = 16U;
@@ -298,6 +310,28 @@ private:
         Adds<float, false>(rowAcc_, rowAcc_, hcEps_, 1U);
         Muls<float, false>(rowAcc_[kPostLocal], rowAcc_[kPostLocal], 2.0F, 1U);
 
+        if constexpr (kRawParam) {
+            SetVectorMask<float>(static_cast<int32_t>(kN));
+            Cast<DT_PARAM, float, false>(paramOutRaw_, rowAcc_[kPostLocal],
+                                         RoundMode::CAST_RINT, MASK_PLACEHOLDER, 1U,
+                                         {1, 1, 4, 8});
+            SetVectorMask<float>(static_cast<int32_t>(kN * kN));
+            Cast<DT_PARAM, float, false>(paramOutRaw_[16U], rowAcc_[kResLocal],
+                                         RoundMode::CAST_RINT, MASK_PLACEHOLDER, 1U,
+                                         {1, 1, 4, 8});
+        }
+        // 先把 hPost/hRes 发出去，其 MTE3 时延与下面的 hIn 计算重叠。
+        SyncVectorToMte3();
+        const DataCopyExtParams postCopy{1, kN * sizeof(DT_PARAM), 0, 0, 0};
+        const DataCopyExtParams resStoreCopy{1, kN * kN * sizeof(DT_PARAM), 0, 0, 0};
+        if constexpr (kRawParam) {
+            DataCopyPad(hPostGm_[position * kN], paramOutRaw_, postCopy);
+            DataCopyPad(hResGm_[position * kN * kN], paramOutRaw_[16U], resStoreCopy);
+        } else {
+            DataCopyPad(hPostGm_[position * kN], rowAcc_[kPostLocal], postCopy);
+            DataCopyPad(hResGm_[position * kN * kN], rowAcc_[kResLocal], resStoreCopy);
+        }
+
         Brcb(product_, rowAcc_, 1U, {1, 8});
         SetVectorMask<float>(8);
         Mul<float, false>(hInAcc_, xFloat_, product_, MASK_PLACEHOLDER, 2U,
@@ -309,33 +343,13 @@ private:
                                            broadcastStrides);
         }
 
-        if constexpr (kRawParam) {
-            SetVectorMask<float>(static_cast<int32_t>(kN));
-            Cast<DT_PARAM, float, false>(paramOutRaw_, rowAcc_[kPostLocal],
-                                         RoundMode::CAST_RINT, MASK_PLACEHOLDER, 1U,
-                                         {1, 1, 4, 8});
-            SetVectorMask<float>(static_cast<int32_t>(kN * kN));
-            Cast<DT_PARAM, float, false>(paramOutRaw_[16U], rowAcc_[kResLocal],
-                                         RoundMode::CAST_RINT, MASK_PLACEHOLDER, 1U,
-                                         {1, 1, 4, 8});
-        }
         if constexpr (kRawX) {
             SetVectorMask<float>(static_cast<int32_t>(kD));
             Cast<DT_X, float, false>(xOutRaw_, hInAcc_, RoundMode::CAST_RINT,
                                      MASK_PLACEHOLDER, 1U, {1, 1, 4, 8});
         }
-
         SyncVectorToMte3();
-        const DataCopyExtParams postCopy{1, kN * sizeof(DT_PARAM), 0, 0, 0};
-        const DataCopyExtParams resStoreCopy{1, kN * kN * sizeof(DT_PARAM), 0, 0, 0};
         const DataCopyExtParams hInCopy{1, kD * sizeof(DT_X), 0, 0, 0};
-        if constexpr (kRawParam) {
-            DataCopyPad(hPostGm_[position * kN], paramOutRaw_, postCopy);
-            DataCopyPad(hResGm_[position * kN * kN], paramOutRaw_[16U], resStoreCopy);
-        } else {
-            DataCopyPad(hPostGm_[position * kN], rowAcc_[kPostLocal], postCopy);
-            DataCopyPad(hResGm_[position * kN * kN], rowAcc_[kResLocal], resStoreCopy);
-        }
         if constexpr (kRawX) {
             DataCopyPad(hInGm_[position * kD], xOutRaw_, hInCopy);
         } else {
@@ -769,7 +783,7 @@ private:
 };
 
 template <typename DT_X, typename DT_PARAM, int FAST_SMALL, int FAST_ONE_POSITION,
-          int FAST_N8>
+          int FAST_N8, int EPS_DEFAULT>
 __global__ __aicore__ void mhc_pre(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
                                    GM_ADDR gamma, GM_ADDR hIn, GM_ADDR hPost, GM_ADDR hRes,
                                    GM_ADDR workspace, GM_ADDR tiling)
@@ -778,7 +792,8 @@ __global__ __aicore__ void mhc_pre(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADD
     if constexpr (FAST_SMALL != 0) {
         InitSocState();
         constexpr uint32_t kStaticN = FAST_N8 != 0 ? 8U : 4U;
-        KernelMhcPreSmallStatic<DT_X, DT_PARAM, kStaticN, FAST_ONE_POSITION != 0> op;
+        KernelMhcPreSmallStatic<DT_X, DT_PARAM, kStaticN, FAST_ONE_POSITION != 0,
+                                EPS_DEFAULT != 0> op;
         op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tiling);
         op.Process();
         PipeBarrier<PIPE_ALL>();

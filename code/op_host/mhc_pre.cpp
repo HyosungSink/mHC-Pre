@@ -22,6 +22,7 @@ constexpr uint32_t kVectorAlignElements = 64;
 constexpr uint32_t kMaxTileElements = 4096;
 constexpr uint64_t kUbSafetyBytes = 8192;
 constexpr uint32_t kFastHiddenDim = 16;
+constexpr float kDefaultEps = 1e-6F;
 
 struct MhcPreShapeInfo {
     uint64_t positionCount;
@@ -234,10 +235,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         (fastSmall != 0U && shapeInfo.positionCount <= coreCount) ? 1U : 0U;
     // n 走 TilingKey，Kernel 侧因此不必在核起始处整体读取 Tiling 结构体。
     const uint32_t fastN8 = shapeInfo.n == 8U ? 1U : 0U;
+    // eps 取默认值时 Kernel 可以完全不读 Tiling；其他取值仍从 Tiling 取，保持通用。
+    const uint32_t epsDefault =
+        (*attrNormEps == kDefaultEps && *attrHcEps == kDefaultEps) ? 1U : 0U;
     const uint32_t blockDim = static_cast<uint32_t>(
         std::min<uint64_t>(coreCount, shapeInfo.positionCount));
     ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition,
-                          fastN8);
+                          fastN8, epsDefault);
     if (context->SetBlockDim(blockDim) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }

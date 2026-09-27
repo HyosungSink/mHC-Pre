@@ -17,22 +17,13 @@ public:
                                 GM_ADDR tiling)
     {
         // n/D/invWidth 由模板定下，gamma 由可选输入指针判定，eps 常见取值走 TilingKey：
-        // 单位置 + 默认 eps 时本路径完全不访问 Tiling 缓冲，省掉核起始处的冷 GM 读取。
+        // 单位置 + 默认 eps 时本路径完全不访问 Tiling 缓冲。
+        // Init 只做地址与指针准备，任何冷 GM 取数都延后到搬运下发之后。
         hasGamma_ = gamma != nullptr;
+        tilingGm_ = tiling;
         if constexpr (EPS_DEFAULT) {
             normEps_ = kDefaultEps;
             hcEps_ = kDefaultEps;
-        }
-        if constexpr (!EPS_DEFAULT || !ONE_POSITION) {
-            __gm__ MhcPreTilingData *tilingPtr =
-                reinterpret_cast<__gm__ MhcPreTilingData *>(tiling);
-            if constexpr (!ONE_POSITION) {
-                positionCount_ = tilingPtr->positionCount;
-            }
-            if constexpr (!EPS_DEFAULT) {
-                normEps_ = tilingPtr->normEps;
-                hcEps_ = tilingPtr->hcEps;
-            }
         }
 
         xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x));
@@ -71,19 +62,24 @@ public:
 
     __aicore__ inline void Process()
     {
+        const uint64_t blockIndex = GetBlockIdx();
+        // x 的搬运先下发，再下发常量搬运，两笔冷访存的时延由同一次
+        // MTE2->V 等待覆盖，而不是一前一后串起来。
+        IssueXLoad(blockIndex);
         LoadConstants();
         if constexpr (ONE_POSITION) {
-            ProcessPosition(GetBlockIdx());
+            ProcessLoaded(blockIndex);
         } else {
-            const uint64_t blockIndex = GetBlockIdx();
             const uint64_t blockCount = GetBlockNum();
             for (uint64_t position = blockIndex; position < positionCount_;
                  position += blockCount) {
                 if (position != blockIndex) {
                     SyncMte3ToVector();
                     SyncVectorToMte2();
+                    IssueXLoad(position);
+                    SyncMte2ToVector();
                 }
-                ProcessPosition(position);
+                ProcessLoaded(position);
             }
         }
         ResetMask();
@@ -166,11 +162,6 @@ private:
 
     __aicore__ inline void LoadConstants()
     {
-        // alpha 直接用标量读 GM，避免向量-标量同步屏障。
-        alpha0_ = static_cast<float>(alphaGm_.GetValue(0U));
-        alpha1_ = static_cast<float>(alphaGm_.GetValue(1U));
-        alpha2_ = static_cast<float>(alphaGm_.GetValue(2U));
-
         const DataCopyExtParams phiCopy{1, kPhiLength * sizeof(DT_PARAM), 0, 0, 0};
         // 两个 block 各自补齐到 32 字节落位，使 pPre/pPost 分别对齐到 0 与 kPostLocal，
         // 同时 GM 侧只从偏移 0 读取，避开非 32 字节对齐的源地址。
@@ -192,6 +183,22 @@ private:
                 DataCopyPad(gammaFloat_, gammaGm_, gammaCopy, {});
             }
         }
+        // 搬运已经下发，现在才做冷标量取数：alpha 的读取时延被上面的 MTE2 掩盖。
+        // 这些值直到每个位置的 Transform 阶段才会被消费。
+        alpha0_ = static_cast<float>(alphaGm_.GetValue(0U));
+        alpha1_ = static_cast<float>(alphaGm_.GetValue(1U));
+        alpha2_ = static_cast<float>(alphaGm_.GetValue(2U));
+        if constexpr (!EPS_DEFAULT || !ONE_POSITION) {
+            __gm__ MhcPreTilingData *tilingPtr =
+                reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
+            if constexpr (!ONE_POSITION) {
+                positionCount_ = tilingPtr->positionCount;
+            }
+            if constexpr (!EPS_DEFAULT) {
+                normEps_ = tilingPtr->normEps;
+                hcEps_ = tilingPtr->hcEps;
+            }
+        }
         SyncMte2ToVector();
         if constexpr (kRawParam) {
             Cast(phiFloat_, phiRaw_, RoundMode::CAST_NONE, kPhiLength);
@@ -202,6 +209,9 @@ private:
             if (hasGamma_) {
                 Cast(gammaFloat_, gammaRaw_, RoundMode::CAST_NONE, kWidth);
             }
+        }
+        if (!hasGamma_) {
+            Duplicate(gammaFloat_, 1.0F, kWidth);
         }
         Duplicate(reduceOut_, 0.0F, 8U);
         if constexpr (kN == 4U) {
@@ -215,18 +225,21 @@ private:
         Muls<float, false>(biasFloat_[kPostLocal], biasFloat_[kPostLocal], -1.0F, 1U);
     }
 
-    __aicore__ inline void ProcessPosition(uint64_t position)
+    __aicore__ inline void IssueXLoad(uint64_t position)
     {
-        const BinaryRepeatParams contiguousBinary{1, 1, 1, 8, 8, 8};
-        const UnaryRepeatParams contiguousUnary{1, 1, 8, 8};
         const DataCopyExtParams xCopy{1, kWidth * sizeof(DT_X), 0, 0, 0};
         if constexpr (kRawX) {
             DataCopyPad(xRaw_, xGm_[position * kWidth], xCopy, {});
         } else {
             DataCopyPad(xFloat_, xGm_[position * kWidth], xCopy, {});
         }
+    }
+
+    __aicore__ inline void ProcessLoaded(uint64_t position)
+    {
+        const BinaryRepeatParams contiguousBinary{1, 1, 1, 8, 8, 8};
+        const UnaryRepeatParams contiguousUnary{1, 1, 8, 8};
         SetVectorMask<float>(64);
-        SyncMte2ToVector();
         if constexpr (kRawX) {
             Cast<float, DT_X, false>(xFloat_, xRaw_, RoundMode::CAST_NONE,
                                      MASK_PLACEHOLDER,
@@ -244,13 +257,9 @@ private:
                                       0);
 
         // gamma 折进 x 而不是 phi：每位置只需 1~2 个 repeat。
-        if (hasGamma_) {
-            Mul<float, false>(hInAcc_, xFloat_, gammaFloat_, MASK_PLACEHOLDER,
-                              static_cast<uint8_t>(kWidthRepeats), contiguousBinary);
-        } else {
-            Muls<float, false>(hInAcc_, xFloat_, 1.0F, MASK_PLACEHOLDER,
-                               static_cast<uint8_t>(kWidthRepeats), contiguousUnary);
-        }
+        // 缺省 gamma 在前处理阶段被填成全 1，这里因此没有分支。
+        Mul<float, false>(hInAcc_, xFloat_, gammaFloat_, MASK_PLACEHOLDER,
+                          static_cast<uint8_t>(kWidthRepeats), contiguousBinary);
 
         const BinaryRepeatParams projectStrides{
             1, 1, 1, 8, 0, static_cast<uint8_t>(8U * kWidthRepeats)};
@@ -383,6 +392,7 @@ private:
     LocalTensor<float> sigmoidTmp_;
     LocalTensor<float> rowAcc_;
 
+    GM_ADDR tilingGm_ = nullptr;
     uint64_t positionCount_ = 0;
     bool hasGamma_ = false;
     float normEps_ = 0.0F;

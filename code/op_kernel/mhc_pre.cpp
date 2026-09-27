@@ -233,7 +233,7 @@ private:
         RepeatReduceSum<float, false>(reduceOut_, product_, 1, MASK_PLACEHOLDER, 0, 1, 1,
                                       0);
 
-        // gamma 折进 x 而不是 phi：每位置只需 1~2 个 repeat。
+        // gamma 折进 x 而不是 phi：每位置只需一个 repeat。
         // 缺省 gamma 在前处理阶段被填成全 1，这里因此没有分支。
         Mul<float, false>(hInAcc_, xFloat_, gammaFloat_, MASK_PLACEHOLDER,
                           static_cast<uint8_t>(kWidthRepeats), contiguousBinary);

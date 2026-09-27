@@ -232,9 +232,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     const uint32_t fastSmall = (paramType == ge::DT_FLOAT && fastShape) ? 1U : 0U;
     const uint32_t fastOnePosition =
         (fastSmall != 0U && shapeInfo.positionCount <= coreCount) ? 1U : 0U;
+    // n 走 TilingKey，Kernel 侧因此不必在核起始处整体读取 Tiling 结构体。
+    const uint32_t fastN8 = shapeInfo.n == 8U ? 1U : 0U;
     const uint32_t blockDim = static_cast<uint32_t>(
         std::min<uint64_t>(coreCount, shapeInfo.positionCount));
-    ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition);
+    ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition,
+                          fastN8);
     if (context->SetBlockDim(blockDim) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }

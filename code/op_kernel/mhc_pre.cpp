@@ -13,13 +13,16 @@ class KernelMhcPreSmallStatic {
 public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
                                 GM_ADDR gamma, GM_ADDR hIn, GM_ADDR hPost, GM_ADDR hRes,
-                                const MhcPreTilingData &tiling)
+                                GM_ADDR tiling)
     {
-        positionCount_ = tiling.positionCount;
-        hasGamma_ = tiling.hasGamma != 0;
-        invWidth_ = tiling.invWidth;
-        normEps_ = tiling.normEps;
-        hcEps_ = tiling.hcEps;
+        // 只取真正随输入变化的三个字段，n/D/invWidth 由模板在编译期定下。
+        // 整体拷贝 Tiling 结构体会在核起始处引入一次阻塞的冷 GM 读取。
+        __gm__ MhcPreTilingData *tilingPtr =
+            reinterpret_cast<__gm__ MhcPreTilingData *>(tiling);
+        positionCount_ = tilingPtr->positionCount;
+        hasGamma_ = tilingPtr->hasGamma != 0;
+        normEps_ = tilingPtr->normEps;
+        hcEps_ = tilingPtr->hcEps;
 
         xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x));
         phiGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(phi));
@@ -84,6 +87,7 @@ private:
     static constexpr uint32_t kPhiLength = kWidth * kRows;
     static constexpr uint32_t kWidthRepeats = kWidth / 64U;
     static constexpr uint32_t kProductLength = 64U * kRows;
+    static constexpr float kInvWidth = 1.0F / static_cast<float>(kWidth);
     // 行缓冲分组偏移：三段起点均为 32 字节整数倍，n=8 时恰好连续。
     static constexpr uint32_t kPostLocal = 8U;
     static constexpr uint32_t kResLocal = 16U;
@@ -260,7 +264,7 @@ private:
         }
 
         SetVectorMask<float>(1);
-        Muls<float, false>(reduceOut_, reduceOut_, invWidth_, 1U);
+        Muls<float, false>(reduceOut_, reduceOut_, kInvWidth, 1U);
         Adds<float, false>(reduceOut_, reduceOut_, normEps_, 1U);
         Rsqrt<float, false>(reduceOut_, reduceOut_, MASK_PLACEHOLDER, 1U,
                             contiguousUnary);
@@ -367,7 +371,6 @@ private:
 
     uint64_t positionCount_ = 0;
     bool hasGamma_ = false;
-    float invWidth_ = 0.0F;
     float normEps_ = 0.0F;
     float hcEps_ = 0.0F;
     float alpha0_ = 0.0F;
@@ -765,7 +768,8 @@ private:
     float alpha2_ = 0.0F;
 };
 
-template <typename DT_X, typename DT_PARAM, int FAST_SMALL, int FAST_ONE_POSITION>
+template <typename DT_X, typename DT_PARAM, int FAST_SMALL, int FAST_ONE_POSITION,
+          int FAST_N8>
 __global__ __aicore__ void mhc_pre(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
                                    GM_ADDR gamma, GM_ADDR hIn, GM_ADDR hPost, GM_ADDR hRes,
                                    GM_ADDR workspace, GM_ADDR tiling)
@@ -773,16 +777,10 @@ __global__ __aicore__ void mhc_pre(GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADD
     REGISTER_TILING_DEFAULT(MhcPreTilingData);
     if constexpr (FAST_SMALL != 0) {
         InitSocState();
-        GET_TILING_DATA_WITH_STRUCT(MhcPreTilingData, tilingData, tiling);
-        if (tilingData.n == 4U) {
-            KernelMhcPreSmallStatic<DT_X, DT_PARAM, 4U, FAST_ONE_POSITION != 0> op;
-            op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tilingData);
-            op.Process();
-        } else {
-            KernelMhcPreSmallStatic<DT_X, DT_PARAM, 8U, FAST_ONE_POSITION != 0> op;
-            op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tilingData);
-            op.Process();
-        }
+        constexpr uint32_t kStaticN = FAST_N8 != 0 ? 8U : 4U;
+        KernelMhcPreSmallStatic<DT_X, DT_PARAM, kStaticN, FAST_ONE_POSITION != 0> op;
+        op.Init(x, phi, alpha, bias, gamma, hIn, hPost, hRes, tiling);
+        op.Process();
         PipeBarrier<PIPE_ALL>();
     } else {
         GET_TILING_DATA_WITH_STRUCT(MhcPreTilingData, tilingData, tiling);

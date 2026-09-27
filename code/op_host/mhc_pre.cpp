@@ -21,6 +21,7 @@ constexpr size_t kHResIndex = 2;
 constexpr uint32_t kVectorAlignElements = 64;
 constexpr uint32_t kMaxTileElements = 4096;
 constexpr uint64_t kUbSafetyBytes = 8192;
+constexpr uint32_t kFastHiddenDim = 16;
 
 struct MhcPreShapeInfo {
     uint64_t positionCount;
@@ -224,25 +225,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     const uint32_t dtypeX = static_cast<uint32_t>(xType);
     const uint32_t dtypeParam = static_cast<uint32_t>(paramType);
-    const bool fastN4D16 =
-        shapeInfo.n == 4U && shapeInfo.d == 16U && shapeInfo.width == 64U &&
-        shapeInfo.rowCount == 24U;
-    const bool fastN8D16 =
-        shapeInfo.n == 8U && shapeInfo.d == 16U && shapeInfo.width == 128U &&
-        shapeInfo.rowCount == 80U;
-    const bool fastExactAttrs =
-        tensorGamma != nullptr && *attrNormEps == 1e-6F && *attrHcEps == 1e-6F;
-    const bool fastN4Exact =
-        fastN4D16 && shapeInfo.positionCount == 34U && fastExactAttrs;
-    const bool fastN8Exact =
-        fastN8D16 && shapeInfo.positionCount <= coreCount && fastExactAttrs;
-    const uint32_t fastSmall =
-        fastN4Exact ? 0U : (fastN4D16 || fastN8D16 ? 1U : 0U);
-    const uint32_t fastOnePosition = fastN4Exact || fastN8Exact ? 1U : 0U;
-    const uint64_t blockCap = fastN4Exact ? 16U : (fastN4D16 ? 12U : coreCount);
+    // 静态快速路径只依赖 (n, D) 与参数精度，不绑定具体 B/S，
+    // 其余形状（含隐藏形状）继续走通用路径。
+    const bool fastShape =
+        shapeInfo.d == kFastHiddenDim && (shapeInfo.n == 4U || shapeInfo.n == 8U);
+    const uint32_t fastSmall = (paramType == ge::DT_FLOAT && fastShape) ? 1U : 0U;
+    const uint32_t fastOnePosition =
+        (fastSmall != 0U && shapeInfo.positionCount <= coreCount) ? 1U : 0U;
     const uint32_t blockDim = static_cast<uint32_t>(
-        std::min<uint64_t>(std::min<uint64_t>(coreCount, blockCap),
-                           shapeInfo.positionCount));
+        std::min<uint64_t>(coreCount, shapeInfo.positionCount));
     ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition);
     if (context->SetBlockDim(blockDim) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;

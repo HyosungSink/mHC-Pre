@@ -23,7 +23,6 @@ constexpr uint32_t kMaxTileElements = 4096;
 constexpr uint64_t kUbSafetyBytes = 8192;
 constexpr uint32_t kFastHiddenDim = 16;
 constexpr float kDefaultEps = 1e-6F;
-constexpr uint64_t kPositionsPerCoreN4 = 2;
 
 struct MhcPreShapeInfo {
     uint64_t positionCount;
@@ -239,15 +238,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     // eps 取默认值时 Kernel 可以完全不读 Tiling；其他取值仍从 Tiling 取，保持通用。
     const uint32_t epsDefault =
         (*attrNormEps == kDefaultEps && *attrHcEps == kDefaultEps) ? 1U : 0U;
-    // n=4 时 hPost 每个位置只占 16 字节（半条缓存行），一核一位置会让多个核
-    // 争用同一条缓存行；给每个核分配 kPositionsPerCoreN4 个连续位置，
-    // 使每个核独占整条缓存行，同时把 phi 的搬运摊薄到该段内的多个位置。
-    const uint64_t positionsPerCore =
-        (fastSmall != 0U && fastN8 == 0U) ? kPositionsPerCoreN4 : 1U;
-    const uint64_t blocksNeeded =
-        (shapeInfo.positionCount + positionsPerCore - 1U) / positionsPerCore;
-    const uint32_t blockDim =
-        static_cast<uint32_t>(std::min<uint64_t>(coreCount, blocksNeeded));
+    // 位置数不超过核数时一核一位置，并行度优先；超过核数时每核负责一段连续位置，
+    // 由 Kernel 侧按 ceil(positionCount/blockDim) 自行分段。
+    const uint32_t blockDim = static_cast<uint32_t>(
+        std::min<uint64_t>(coreCount, shapeInfo.positionCount));
     ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition,
                           fastN8, epsDefault);
     if (context->SetBlockDim(blockDim) != ge::GRAPH_SUCCESS) {

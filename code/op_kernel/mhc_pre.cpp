@@ -19,9 +19,12 @@ public:
     {
         hasGamma_ = gamma != nullptr;
         tilingGm_ = tiling;
-        // Process() 用 positionCount_ 算分段边界，因此这一项必须在此读出。
-        positionCount_ =
-            reinterpret_cast<__gm__ MhcPreTilingData *>(tiling)->positionCount;
+        if constexpr (!ONE_POSITION) {
+            // 分段模式下 Process() 用 positionCount_ 算边界，故此处读出；
+            // 一核一位置时不需要它，连这次标量取数也省掉。
+            positionCount_ =
+                reinterpret_cast<__gm__ MhcPreTilingData *>(tiling)->positionCount;
+        }
         if constexpr (EPS_DEFAULT) {
             normEps_ = kDefaultEps;
             hcEps_ = kDefaultEps;
@@ -65,6 +68,17 @@ public:
 
     __aicore__ inline void Process()
     {
+        if constexpr (ONE_POSITION) {
+            // 位置数不超过核数：每核恰好一个位置，index 恒为 0，
+            // 段内偏移与循环控制全部在编译期折叠掉。
+            const uint64_t position = GetBlockIdx();
+            IssueXLoad(position, 1U);
+            LoadConstants();
+            ComputePosition(0U);
+            StoreRange(position, 1U);
+            ResetMask();
+            return;
+        }
         // 连续分段：每个核独占若干整条缓存行，phi 的搬运被段内位置摊薄。
         const uint64_t blockCount = GetBlockNum();
         const uint64_t perBlock = (positionCount_ + blockCount - 1U) / blockCount;

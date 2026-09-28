@@ -21,6 +21,9 @@ public:
         // Init 只做地址与指针准备，任何冷 GM 取数都延后到搬运下发之后。
         hasGamma_ = gamma != nullptr;
         tilingGm_ = tiling;
+        // Process() 用 positionCount_ 算分段边界，因此这一项必须在此读出。
+        positionCount_ =
+            reinterpret_cast<__gm__ MhcPreTilingData *>(tiling)->positionCount;
         if constexpr (EPS_DEFAULT) {
             normEps_ = kDefaultEps;
             hcEps_ = kDefaultEps;
@@ -165,10 +168,9 @@ private:
         alpha0_ = static_cast<float>(alphaGm_.GetValue(0U));
         alpha1_ = static_cast<float>(alphaGm_.GetValue(1U));
         alpha2_ = static_cast<float>(alphaGm_.GetValue(2U));
-        __gm__ MhcPreTilingData *tilingPtr =
-            reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
-        positionCount_ = tilingPtr->positionCount;
         if constexpr (!EPS_DEFAULT) {
+            __gm__ MhcPreTilingData *tilingPtr =
+                reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
             normEps_ = tilingPtr->normEps;
             hcEps_ = tilingPtr->hcEps;
         }

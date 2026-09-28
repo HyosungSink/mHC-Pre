@@ -59,22 +59,25 @@ public:
         const uint64_t blockIndex = GetBlockIdx();
         // x 的搬运先下发，再下发常量搬运，两笔冷访存的时延由同一次
         // MTE2->V 等待覆盖，而不是一前一后串起来。
-        IssueXLoad(blockIndex);
+        // 每个核负责一段连续位置，而不是按核数跨步取位置。
+        // hPost 每个位置只有 kN*4=16 字节，即半条 32 字节缓存行；跨步分配会让
+        // 相邻位置落到不同核上，多个核因此争用同一条缓存行。连续分段后每个核
+        // 独占整条缓存行，phi 的搬运也被该段内的多个位置摊薄。
+        const uint64_t blockCount = GetBlockNum();
+        const uint64_t perBlock = (positionCount_ + blockCount - 1U) / blockCount;
+        const uint64_t begin = blockIndex * perBlock;
+        const uint64_t end =
+            begin + perBlock < positionCount_ ? begin + perBlock : positionCount_;
+        IssueXLoad(begin);
         LoadConstants();
-        if constexpr (ONE_POSITION) {
-            ProcessLoaded(blockIndex);
-        } else {
-            const uint64_t blockCount = GetBlockNum();
-            for (uint64_t position = blockIndex; position < positionCount_;
-                 position += blockCount) {
-                if (position != blockIndex) {
-                    SyncMte3ToVector();
-                    SyncVectorToMte2();
-                    IssueXLoad(position);
-                    SyncMte2ToVector();
-                }
-                ProcessLoaded(position);
+        for (uint64_t position = begin; position < end; ++position) {
+            if (position != begin) {
+                SyncMte3ToVector();
+                SyncVectorToMte2();
+                IssueXLoad(position);
+                SyncMte2ToVector();
             }
+            ProcessLoaded(position);
         }
         ResetMask();
     }
@@ -162,16 +165,12 @@ private:
         alpha0_ = static_cast<float>(alphaGm_.GetValue(0U));
         alpha1_ = static_cast<float>(alphaGm_.GetValue(1U));
         alpha2_ = static_cast<float>(alphaGm_.GetValue(2U));
-        if constexpr (!EPS_DEFAULT || !ONE_POSITION) {
-            __gm__ MhcPreTilingData *tilingPtr =
-                reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
-            if constexpr (!ONE_POSITION) {
-                positionCount_ = tilingPtr->positionCount;
-            }
-            if constexpr (!EPS_DEFAULT) {
-                normEps_ = tilingPtr->normEps;
-                hcEps_ = tilingPtr->hcEps;
-            }
+        __gm__ MhcPreTilingData *tilingPtr =
+            reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
+        positionCount_ = tilingPtr->positionCount;
+        if constexpr (!EPS_DEFAULT) {
+            normEps_ = tilingPtr->normEps;
+            hcEps_ = tilingPtr->hcEps;
         }
         SyncMte2ToVector();
         if (!hasGamma_) {

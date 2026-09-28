@@ -23,7 +23,7 @@ constexpr uint32_t kMaxTileElements = 4096;
 constexpr uint64_t kUbSafetyBytes = 8192;
 constexpr uint32_t kFastHiddenDim = 16;
 constexpr float kDefaultEps = 1e-6F;
-constexpr uint64_t kPositionsPerCoreN4 = 4;
+constexpr uint64_t kPositionsPerCoreN4 = 2;
 
 struct MhcPreShapeInfo {
     uint64_t positionCount;

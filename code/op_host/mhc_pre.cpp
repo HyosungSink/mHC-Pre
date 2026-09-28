@@ -238,8 +238,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     // eps 取默认值时 Kernel 可以完全不读 Tiling；其他取值仍从 Tiling 取，保持通用。
     const uint32_t epsDefault =
         (*attrNormEps == kDefaultEps && *attrHcEps == kDefaultEps) ? 1U : 0U;
-    // 位置数不超过核数时一核一位置，并行度优先；超过核数时每核负责一段连续位置，
-    // 由 Kernel 侧按 ceil(positionCount/blockDim) 自行分段。
     const uint32_t blockDim = static_cast<uint32_t>(
         std::min<uint64_t>(coreCount, shapeInfo.positionCount));
     ASCENDC_TPL_SEL_PARAM(context, dtypeX, dtypeParam, fastSmall, fastOnePosition,

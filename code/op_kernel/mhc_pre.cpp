@@ -5,10 +5,9 @@
 
 using namespace AscendC;
 
-// n=4、D=16 的快速路径。每个核负责一段连续位置，把该段所有位置的三路输出
-// 先在 UB 中按位置打包，段末只发三笔搬运。NPU 剖析显示 MTE3 的耗时与全设备
-// 搬运描述符的条数成正比（每条约 33ns），与单条的字节数几乎无关：
-// 每位置三笔时 pc=40 共 120 条描述符约 4.2μs，占 aiv 时间一半以上。
+// 静态形状快速路径：D=16 且 n 为 4/8 时展开为编译期常量，
+// 行缓冲按 32 字节分组排布，使 pPre/pPost/pRes 三段全部对齐，
+// 从而避免 Gather 与标量-向量往返同步。
 template <class DT_X, class DT_PARAM, uint32_t STATIC_N, bool ONE_POSITION,
           bool EPS_DEFAULT>
 class KernelMhcPreSmallStatic {
@@ -17,14 +16,11 @@ public:
                                 GM_ADDR gamma, GM_ADDR hIn, GM_ADDR hPost, GM_ADDR hRes,
                                 GM_ADDR tiling)
     {
+        // n/D/invWidth 由模板定下，gamma 由可选输入指针判定，eps 常见取值走 TilingKey：
+        // 单位置 + 默认 eps 时本路径完全不访问 Tiling 缓冲。
+        // Init 只做地址与指针准备，任何冷 GM 取数都延后到搬运下发之后。
         hasGamma_ = gamma != nullptr;
         tilingGm_ = tiling;
-        if constexpr (!ONE_POSITION) {
-            // 分段模式下 Process() 用 positionCount_ 算边界，故此处读出；
-            // 一核一位置时不需要它，连这次标量取数也省掉。
-            positionCount_ =
-                reinterpret_cast<__gm__ MhcPreTilingData *>(tiling)->positionCount;
-        }
         if constexpr (EPS_DEFAULT) {
             normEps_ = kDefaultEps;
             hcEps_ = kDefaultEps;
@@ -41,98 +37,68 @@ public:
         hPostGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(hPost));
         hResGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_PARAM *>(hRes));
 
-        if constexpr (kRawX) {
-            xRaw_ = LocalTensor<DT_X>(TPosition::VECIN, kXRawAddress, kChunk * kWidth);
+        if constexpr (!IsSameType<DT_X, float>::value) {
+            xRaw_ = LocalTensor<DT_X>(TPosition::VECIN, kXRawAddress, kWidth);
+            xOutRaw_ = LocalTensor<DT_X>(TPosition::VECOUT, kXOutAddress, kD);
         }
-        xFloat_ = LocalTensor<float>(TPosition::VECIN, kXFloatAddress, kChunk * kWidth);
+        xFloat_ = LocalTensor<float>(TPosition::VECIN, kXFloatAddress, kWidth);
         phiFloat_ = LocalTensor<float>(TPosition::VECIN, kPhiFloatAddress, kPhiLength);
-        biasFloat_ = LocalTensor<float>(TPosition::VECIN, kBiasFloatAddress, kBiasLength);
+        biasFloat_ = LocalTensor<float>(TPosition::VECIN, kBiasFloatAddress, kRowLength);
         gammaFloat_ = LocalTensor<float>(TPosition::VECIN, kGammaFloatAddress, kWidth);
         product_ = LocalTensor<float>(TPosition::VECCALC, kProductAddress, kProductLength);
-        reduceOut_ = LocalTensor<float>(TPosition::VECCALC, kReduceAddress, 64U);
-        rmsBrcb_ = LocalTensor<float>(TPosition::VECCALC, kRmsBrcbAddress, 64U);
-        preAcc_ = LocalTensor<float>(TPosition::VECCALC, kPreAddress, 8U);
-        sigmoidTmp_ = LocalTensor<float>(TPosition::VECCALC, kSigmoidAddress, 8U);
-        hInAcc_ = LocalTensor<float>(TPosition::VECCALC, kHInAccAddress, kD);
-        xg_ = LocalTensor<float>(TPosition::VECCALC, kXgAddress, kWidth);
-        postPack_ = LocalTensor<float>(TPosition::VECOUT, kPostPackAddress, kChunk * 8U);
-        resPack_ = LocalTensor<float>(TPosition::VECOUT, kResPackAddress,
-                                     kChunk * kN * kN);
-        if constexpr (kRawX) {
-            hInPack_ = LocalTensor<DT_X>(TPosition::VECOUT, kHInPackAddress, kChunk * kD);
-        } else {
-            hInPackFloat_ =
-                LocalTensor<float>(TPosition::VECOUT, kHInPackAddress, kChunk * kD);
-        }
+        hInAcc_ = LocalTensor<float>(TPosition::VECOUT, kHInAddress, kWidth);
+        reduceOut_ = LocalTensor<float>(TPosition::VECCALC, kReduceAddress, 8U);
+        sigmoidTmp_ = LocalTensor<float>(TPosition::VECCALC, kSigmoidAddress, 16U);
+        postScale_ = LocalTensor<float>(TPosition::VECCALC, kPostScaleAddress, 8U);
+        postEps_ = LocalTensor<float>(TPosition::VECCALC, kPostEpsAddress, 8U);
+        rowAcc_ = LocalTensor<float>(TPosition::VECOUT, kRowAddress, kRowLength);
     }
 
     __aicore__ inline void Process()
     {
-        if constexpr (ONE_POSITION) {
-            // 位置数不超过核数：每核恰好一个位置，index 恒为 0，
-            // 段内偏移与循环控制全部在编译期折叠掉。
-            const uint64_t position = GetBlockIdx();
-            IssueXLoad(position, 1U);
-            LoadConstants();
-            ComputePosition(0U);
-            StoreRange(position, 1U);
-            ResetMask();
-            return;
-        }
-        // 连续分段：每个核独占若干整条缓存行，phi 的搬运被段内位置摊薄。
-        const uint64_t blockCount = GetBlockNum();
-        const uint64_t perBlock = (positionCount_ + blockCount - 1U) / blockCount;
-        const uint64_t begin = static_cast<uint64_t>(GetBlockIdx()) * perBlock;
-        const uint64_t end =
-            begin + perBlock < positionCount_ ? begin + perBlock : positionCount_;
-        if (begin >= end) {
-            return;
-        }
-        uint32_t firstCount = static_cast<uint32_t>(end - begin);
-        if (firstCount > kChunk) {
-            firstCount = kChunk;
-        }
-        IssueXLoad(begin, firstCount);
+        const uint64_t blockIndex = GetBlockIdx();
+        // x 的搬运先下发，再下发常量搬运，两笔冷访存的时延由同一次
+        // MTE2->V 等待覆盖，而不是一前一后串起来。
+        IssueXLoad(blockIndex);
         LoadConstants();
-        bool firstPass = true;
-        for (uint64_t base = begin; base < end; base += kChunk) {
-            uint32_t count = static_cast<uint32_t>(end - base);
-            if (count > kChunk) {
-                count = kChunk;
+        if constexpr (ONE_POSITION) {
+            ProcessLoaded(blockIndex);
+        } else {
+            const uint64_t blockCount = GetBlockNum();
+            for (uint64_t position = blockIndex; position < positionCount_;
+                 position += blockCount) {
+                if (position != blockIndex) {
+                    SyncMte3ToVector();
+                    SyncVectorToMte2();
+                    IssueXLoad(position);
+                    SyncMte2ToVector();
+                }
+                ProcessLoaded(position);
             }
-            if (!firstPass) {
-                SyncMte3ToVector();
-                SyncVectorToMte2();
-                IssueXLoad(base, count);
-                SyncMte2ToVector();
-            }
-            firstPass = false;
-            for (uint32_t index = 0; index < count; ++index) {
-                ComputePosition(index);
-            }
-            StoreRange(base, count);
         }
         ResetMask();
     }
 
 private:
-    // hPost 由 hIn 已经要做的 Brcb 之外单独归约到对齐槽位，因此 2n 不受 Brcb 限制，
-    // 但本结构其余部分按 n=4 展开；n=8 使用 KernelMhcPreLegacyN8。
+    // hPost 经由 hIn 的 Brcb 输出取出，Brcb 单次只展开 8 个 lane，
+    // 因此该结构要求 2n <= 8；n=8 使用 KernelMhcPreLegacyN8。
     static_assert(STATIC_N == 4U);
     static constexpr uint32_t kN = STATIC_N;
     static constexpr uint32_t kD = 16U;
     static constexpr uint32_t kWidth = kN * kD;
     static constexpr uint32_t kRows = kN * (kN + 2U);
     static constexpr uint32_t kPhiLength = kWidth * kRows;
+    static constexpr uint32_t kWidthRepeats = kWidth / 64U;
     static constexpr uint32_t kProductLength = 64U * kRows;
     static constexpr float kInvWidth = 1.0F / static_cast<float>(kWidth);
     static constexpr float kDefaultEps = 1e-6F;
-    // 每个核单趟最多处理的位置数；段更长时按趟循环。
-    static constexpr uint32_t kChunk = 16U;
-    // bias 分组槽位：pre@0、post@8、res@16，三段起点均 32 字节对齐。
-    static constexpr uint32_t kBiasPost = 8U;
-    static constexpr uint32_t kBiasRes = 16U;
-    static constexpr uint32_t kBiasLength = kBiasRes + kN * kN;
+    // 行缓冲连续排布（与 GM 中 bias 的顺序一致）：pPre@0、pPost@kN、pRes@2kN。
+    // pRes 起点 2n 个 float 是 32 字节整数倍；pPost 不必对齐，它只经由
+    // hIn 本来就要做的 Brcb 取出，再用跨步搬运写回。
+    static constexpr uint32_t kPostLocal = kN;
+    static constexpr uint32_t kResLocal = 2U * kN;
+    static constexpr uint32_t kRowLength = kRows;
+    static constexpr uint32_t kRowBlocks = kRowLength / 8U;
     static constexpr bool kRawX = !IsSameType<DT_X, float>::value;
 
     static constexpr uint32_t Align32(uint32_t value)
@@ -142,29 +108,20 @@ private:
 
     static constexpr uint32_t kXRawAddress = 0U;
     static constexpr uint32_t kXFloatAddress =
-        Align32(kXRawAddress + (kRawX ? kChunk * kWidth * sizeof(DT_X) : 0U));
-    static constexpr uint32_t kPhiFloatAddress =
-        Align32(kXFloatAddress + kChunk * kWidth * 4U);
+        Align32(kXRawAddress + (kRawX ? kWidth * sizeof(DT_X) : 0U));
+    static constexpr uint32_t kPhiFloatAddress = Align32(kXFloatAddress + kWidth * 4U);
     static constexpr uint32_t kBiasFloatAddress =
         Align32(kPhiFloatAddress + kPhiLength * 4U);
     static constexpr uint32_t kGammaFloatAddress =
-        Align32(kBiasFloatAddress + kBiasLength * 4U);
-    static constexpr uint32_t kProductAddress =
-        Align32(kGammaFloatAddress + kWidth * 4U);
-    static constexpr uint32_t kReduceAddress =
-        Align32(kProductAddress + kProductLength * 4U);
-    // Brcb 单次 repeat 写 8 个 block，故此处需要 64 个 float 的空间。
-    static constexpr uint32_t kRmsBrcbAddress = kReduceAddress + 64U * 4U;
-    static constexpr uint32_t kPreAddress = kRmsBrcbAddress + 64U * 4U;
-    static constexpr uint32_t kSigmoidAddress = kPreAddress + 32U;
-    static constexpr uint32_t kHInAccAddress = kSigmoidAddress + 32U;
-    static constexpr uint32_t kPostPackAddress = Align32(kHInAccAddress + kD * 4U);
-    static constexpr uint32_t kResPackAddress =
-        Align32(kPostPackAddress + kChunk * 8U * 4U);
-    static constexpr uint32_t kHInPackAddress =
-        Align32(kResPackAddress + kChunk * kN * kN * 4U);
-    static constexpr uint32_t kXgAddress =
-        Align32(kHInPackAddress + kChunk * kD * (kRawX ? sizeof(DT_X) : 4U));
+        Align32(kBiasFloatAddress + kRowLength * 4U);
+    static constexpr uint32_t kProductAddress = Align32(kGammaFloatAddress + kWidth * 4U);
+    static constexpr uint32_t kHInAddress = Align32(kProductAddress + kProductLength * 4U);
+    static constexpr uint32_t kReduceAddress = Align32(kHInAddress + kWidth * 4U);
+    static constexpr uint32_t kSigmoidAddress = kReduceAddress + 32U;
+    static constexpr uint32_t kPostScaleAddress = Align32(kSigmoidAddress + 16U * 4U);
+    static constexpr uint32_t kPostEpsAddress = kPostScaleAddress + 32U;
+    static constexpr uint32_t kRowAddress = kPostEpsAddress + 32U;
+    static constexpr uint32_t kXOutAddress = Align32(kRowAddress + kRowLength * 4U);
 
     __aicore__ inline void SyncMte2ToVector()
     {
@@ -190,11 +147,64 @@ private:
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }
 
-    __aicore__ inline void IssueXLoad(uint64_t position, uint32_t count)
+    __aicore__ inline void LoadConstants()
     {
-        // 一段位置的 x 在 GM 中连续，一笔搬运即可覆盖整段。
-        const DataCopyExtParams xCopy{
-            1, static_cast<uint32_t>(count * kWidth * sizeof(DT_X)), 0, 0, 0};
+        const DataCopyExtParams phiCopy{1, kPhiLength * sizeof(DT_PARAM), 0, 0, 0};
+        const DataCopyExtParams biasCopy{1, kRows * sizeof(DT_PARAM), 0, 0, 0};
+        const DataCopyExtParams gammaCopy{1, kWidth * sizeof(DT_PARAM), 0, 0, 0};
+        DataCopyPad(phiFloat_, phiGm_, phiCopy, {});
+        DataCopyPad(biasFloat_, biasGm_, biasCopy, {});
+        if (hasGamma_) {
+            DataCopyPad(gammaFloat_, gammaGm_, gammaCopy, {});
+        }
+        // 搬运已经下发，现在才做冷标量取数：alpha 的读取时延被上面的 MTE2 掩盖。
+        // 这些值直到每个位置的 Transform 阶段才会被消费。
+        alpha0_ = static_cast<float>(alphaGm_.GetValue(0U));
+        alpha1_ = static_cast<float>(alphaGm_.GetValue(1U));
+        alpha2_ = static_cast<float>(alphaGm_.GetValue(2U));
+        if constexpr (!EPS_DEFAULT || !ONE_POSITION) {
+            __gm__ MhcPreTilingData *tilingPtr =
+                reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
+            if constexpr (!ONE_POSITION) {
+                positionCount_ = tilingPtr->positionCount;
+            }
+            if constexpr (!EPS_DEFAULT) {
+                normEps_ = tilingPtr->normEps;
+                hcEps_ = tilingPtr->hcEps;
+            }
+        }
+        SyncMte2ToVector();
+        if (!hasGamma_) {
+            Duplicate(gammaFloat_, 1.0F, kWidth);
+        }
+        Duplicate(reduceOut_, 0.0F, 8U);
+        // postScale_ = [1 x n, 2 x n]，postEps_ = [hcEps x n, 0 x n]，
+        // 与 [pPre | pPost] 的 lane 顺序对应；用受 mask 限制的写入构造前半段。
+        Duplicate(postScale_, 2.0F, 8U);
+        Duplicate(postEps_, 0.0F, 8U);
+        SetMaskNorm();
+        SetVectorMask<float>(static_cast<int32_t>(kN));
+        Adds<float, false>(postScale_, postScale_, -1.0F, 1U);
+        Adds<float, false>(postEps_, postEps_, hcEps_, 1U);
+        // sigmoid 用 1/(1+exp(-z))：pPre/pPost 两段连续，bias 一次取反即可。
+        SetVectorMask<float>(static_cast<int32_t>(2U * kN));
+        Muls<float, false>(biasFloat_, biasFloat_, -1.0F, 1U);
+        // alpha 折进 phi：每位置因此不再需要任何 alpha 运算。
+        SetVectorMask<float>(64);
+        const UnaryRepeatParams rowStrides{1, 1, 8, 8};
+        Muls<float, false>(phiFloat_, phiFloat_, -alpha0_, MASK_PLACEHOLDER,
+                           static_cast<uint8_t>(kN * kWidthRepeats), rowStrides);
+        Muls<float, false>(phiFloat_[kN * kWidth], phiFloat_[kN * kWidth], -alpha1_,
+                           MASK_PLACEHOLDER, static_cast<uint8_t>(kN * kWidthRepeats),
+                           rowStrides);
+        Muls<float, false>(phiFloat_[2U * kN * kWidth], phiFloat_[2U * kN * kWidth],
+                           alpha2_, MASK_PLACEHOLDER,
+                           static_cast<uint8_t>(kN * kN * kWidthRepeats), rowStrides);
+    }
+
+    __aicore__ inline void IssueXLoad(uint64_t position)
+    {
+        const DataCopyExtParams xCopy{1, kWidth * sizeof(DT_X), 0, 0, 0};
         if constexpr (kRawX) {
             DataCopyPad(xRaw_, xGm_[position * kWidth], xCopy, {});
         } else {
@@ -202,168 +212,104 @@ private:
         }
     }
 
-    __aicore__ inline void LoadConstants()
+    __aicore__ inline void ProcessLoaded(uint64_t position)
     {
-        const DataCopyExtParams phiCopy{1, kPhiLength * sizeof(DT_PARAM), 0, 0, 0};
-        // 两个 block 各自补齐到 32 字节落位，使 pre/post 分别对齐到 0 与 kBiasPost，
-        // 且 GM 侧只从偏移 0 读取，避开非 32 字节对齐的源地址。
-        const DataCopyExtParams biasPairCopy{2, kN * sizeof(DT_PARAM), 0, 0, 0};
-        const DataCopyExtParams biasResCopy{1, kN * kN * sizeof(DT_PARAM), 0, 0, 0};
-        const DataCopyExtParams gammaCopy{1, kWidth * sizeof(DT_PARAM), 0, 0, 0};
-        DataCopyPad(phiFloat_, phiGm_, phiCopy, {});
-        DataCopyPad(biasFloat_, biasGm_, biasPairCopy, {});
-        DataCopyPad(biasFloat_[kBiasRes], biasGm_[2U * kN], biasResCopy, {});
-        if (hasGamma_) {
-            DataCopyPad(gammaFloat_, gammaGm_, gammaCopy, {});
-        }
-        // 搬运已经下发，现在才做冷标量取数，其时延被上面的 MTE2 掩盖。
-        alpha0_ = static_cast<float>(alphaGm_.GetValue(0U));
-        alpha1_ = static_cast<float>(alphaGm_.GetValue(1U));
-        alpha2_ = static_cast<float>(alphaGm_.GetValue(2U));
-        if constexpr (!EPS_DEFAULT) {
-            __gm__ MhcPreTilingData *tilingPtr =
-                reinterpret_cast<__gm__ MhcPreTilingData *>(tilingGm_);
-            normEps_ = tilingPtr->normEps;
-            hcEps_ = tilingPtr->hcEps;
-        }
-        SyncMte2ToVector();
-        if (!hasGamma_) {
-            Duplicate(gammaFloat_, 1.0F, kWidth);
-        }
-        Duplicate(reduceOut_, 0.0F, 64U);
-        SetMaskNorm();
-        SetVectorMask<float>(static_cast<int32_t>(kN));
-        // sigmoid 用 1/(1+exp(-z))，故把 pre/post 两段的 bias 预先取反。
-        Muls<float, false>(biasFloat_, biasFloat_, -1.0F, 1U);
-        Muls<float, false>(biasFloat_[kBiasPost], biasFloat_[kBiasPost], -1.0F, 1U);
-        // alpha 折进 phi：每位置因此不再需要任何 alpha 运算。
-        SetVectorMask<float>(64);
-        const UnaryRepeatParams rowStrides{1, 1, 8, 8};
-        Muls<float, false>(phiFloat_, phiFloat_, -alpha0_, MASK_PLACEHOLDER,
-                           static_cast<uint8_t>(kN), rowStrides);
-        Muls<float, false>(phiFloat_[kN * kWidth], phiFloat_[kN * kWidth], -alpha1_,
-                           MASK_PLACEHOLDER, static_cast<uint8_t>(kN), rowStrides);
-        Muls<float, false>(phiFloat_[2U * kN * kWidth], phiFloat_[2U * kN * kWidth],
-                           alpha2_, MASK_PLACEHOLDER, static_cast<uint8_t>(kN * kN),
-                           rowStrides);
-    }
-
-    __aicore__ inline void ComputePosition(uint32_t index)
-    {
-        const uint32_t xOff = index * kWidth;
         const BinaryRepeatParams contiguousBinary{1, 1, 1, 8, 8, 8};
         const UnaryRepeatParams contiguousUnary{1, 1, 8, 8};
         SetVectorMask<float>(64);
         if constexpr (kRawX) {
-            Cast<float, DT_X, false>(xFloat_[xOff], xRaw_[xOff], RoundMode::CAST_NONE,
-                                     MASK_PLACEHOLDER, 1U, {1, 1, 8, 4});
+            Cast<float, DT_X, false>(xFloat_, xRaw_, RoundMode::CAST_NONE,
+                                     MASK_PLACEHOLDER,
+                                     static_cast<uint8_t>(kWidthRepeats), {1, 1, 8, 4});
         }
-        // invRms 用原始 xFlat 的平方均值，与 gamma 无关；Rsqrt 的时延被投影掩盖。
-        Mul<float, false>(product_, xFloat_[xOff], xFloat_[xOff], MASK_PLACEHOLDER, 1U,
+
+        // invRms 用原始 xFlat 的平方均值，与 gamma 无关。
+        Mul<float, false>(product_, xFloat_, xFloat_, MASK_PLACEHOLDER, 1U,
                           contiguousBinary);
+        if constexpr (kWidthRepeats == 2U) {
+            MulAddDst<float, float, false>(product_, xFloat_[64U], xFloat_[64U],
+                                           MASK_PLACEHOLDER, 1U, contiguousBinary);
+        }
         RepeatReduceSum<float, false>(reduceOut_, product_, 1, MASK_PLACEHOLDER, 0, 1, 1,
                                       0);
+
+        // gamma 折进 x 而不是 phi：每位置只需 1~2 个 repeat。
+        // 缺省 gamma 在前处理阶段被填成全 1，这里因此没有分支。
+        Mul<float, false>(hInAcc_, xFloat_, gammaFloat_, MASK_PLACEHOLDER,
+                          static_cast<uint8_t>(kWidthRepeats), contiguousBinary);
+
+        const BinaryRepeatParams projectStrides{
+            1, 1, 1, 8, 0, static_cast<uint8_t>(8U * kWidthRepeats)};
+        Mul<float, false>(product_, hInAcc_, phiFloat_, MASK_PLACEHOLDER,
+                          static_cast<uint8_t>(kRows), projectStrides);
+        if constexpr (kWidthRepeats == 2U) {
+            MulAddDst<float, float, false>(product_, hInAcc_[64U], phiFloat_[64U],
+                                           MASK_PLACEHOLDER,
+                                           static_cast<uint8_t>(kRows), projectStrides);
+        }
+        RepeatReduceSum<float, false>(rowAcc_, product_, static_cast<int32_t>(kRows),
+                                      MASK_PLACEHOLDER, 0, 1, 1, 8);
+
+        SetVectorMask<float>(1);
         Muls<float, false>(reduceOut_, reduceOut_, kInvWidth, 1U);
         Adds<float, false>(reduceOut_, reduceOut_, normEps_, 1U);
         Rsqrt<float, false>(reduceOut_, reduceOut_, MASK_PLACEHOLDER, 1U,
                             contiguousUnary);
-        // gamma 折进 x；缺省 gamma 在前处理阶段被填成全 1，这里因此没有分支。
-        Mul<float, false>(xg_, xFloat_[xOff], gammaFloat_, MASK_PLACEHOLDER, 1U,
+        Brcb(product_, reduceOut_, 1U, {1, 8});
+
+        SetVectorMask<float>(8);
+        const BinaryRepeatParams broadcastStrides{1, 1, 1, 1, 1, 0};
+        Mul<float, false>(rowAcc_, rowAcc_, product_, MASK_PLACEHOLDER,
+                          static_cast<uint8_t>(kRowBlocks), broadcastStrides);
+        // alpha 已在前处理阶段折进 phi，这里只剩一次整段 bias 相加。
+        SetVectorMask<float>(static_cast<int32_t>(kRows));
+        Add<float, false>(rowAcc_, rowAcc_, biasFloat_, MASK_PLACEHOLDER, 1U,
                           contiguousBinary);
 
-        const BinaryRepeatParams projectStrides{1, 1, 1, 8, 0, 8};
-        Mul<float, false>(product_, xg_, phiFloat_, MASK_PLACEHOLDER,
-                          static_cast<uint8_t>(kRows), projectStrides);
-        // 三段分别归约到各自 32 字节对齐的槽位：pre 复用一个临时槽，
-        // post/res 直接落到按位置打包的输出缓冲，段末一次搬完。
-        RepeatReduceSum<float, false>(preAcc_, product_, static_cast<int32_t>(kN),
-                                      MASK_PLACEHOLDER, 0, 1, 1, 8);
-        RepeatReduceSum<float, false>(postPack_[index * 8U], product_[kN * 64U],
-                                      static_cast<int32_t>(kN), MASK_PLACEHOLDER, 0, 1,
-                                      1, 8);
-        RepeatReduceSum<float, false>(resPack_[index * kN * kN], product_[2U * kN * 64U],
-                                      static_cast<int32_t>(kN * kN), MASK_PLACEHOLDER, 0,
-                                      1, 1, 8);
-
-        Brcb(rmsBrcb_, reduceOut_, 1U, {1, 8});
-        SetVectorMask<float>(static_cast<int32_t>(kN));
-        const BinaryRepeatParams broadcastStrides{1, 1, 1, 1, 1, 0};
-        Mul<float, false>(preAcc_, preAcc_, rmsBrcb_, MASK_PLACEHOLDER, 1U,
-                          broadcastStrides);
-        Mul<float, false>(postPack_[index * 8U], postPack_[index * 8U], rmsBrcb_,
-                          MASK_PLACEHOLDER, 1U, broadcastStrides);
-        Add<float, false>(preAcc_, preAcc_, biasFloat_, MASK_PLACEHOLDER, 1U,
+        // pPre 与 pPost 同处一个 block，sigmoid 一次覆盖两段；
+        // hcEps 与 hPost 的 2 倍则由两个常量向量按 lane 施加。
+        SetVectorMask<float>(static_cast<int32_t>(2U * kN));
+        Exp<float, false>(sigmoidTmp_, rowAcc_, MASK_PLACEHOLDER, 1U, contiguousUnary);
+        Adds<float, false>(sigmoidTmp_, sigmoidTmp_, 1.0F, 1U);
+        Reciprocal<float, false>(rowAcc_, sigmoidTmp_, MASK_PLACEHOLDER, 1U,
+                                 contiguousUnary);
+        Mul<float, false>(rowAcc_, rowAcc_, postScale_, MASK_PLACEHOLDER, 1U,
                           contiguousBinary);
-        Add<float, false>(postPack_[index * 8U], postPack_[index * 8U],
-                          biasFloat_[kBiasPost], MASK_PLACEHOLDER, 1U, contiguousBinary);
-        // invRms 只在 block 0，因此按 mask 8 多次 repeat、src1 repeat stride 取 0，
-        // 让每个 repeat 都重新读 block 0；mask 16 单 repeat 会读到 block 1 的无效值。
+        Add<float, false>(rowAcc_, rowAcc_, postEps_, MASK_PLACEHOLDER, 1U,
+                          contiguousBinary);
+
+        // Brcb 把 pPre/pPost 每个 lane 展开成一个 block：低 kN 个 block 供 hIn 使用，
+        // 紧接的 kN 个 block 即是 hPost，用跨步搬运直接写回，无需再对齐一份副本。
+        Brcb(product_, rowAcc_, 1U, {1, 8});
+        // 先把 hPost/hRes 发出去，其 MTE3 时延与下面的 hIn 计算重叠。
+        SyncVectorToMte3();
+        const DataCopyExtParams postCopy{static_cast<uint16_t>(kN), sizeof(DT_PARAM), 0,
+                                         0, 0};
+        const DataCopyExtParams resStoreCopy{1, kN * kN * sizeof(DT_PARAM), 0, 0, 0};
+        DataCopyPad(hPostGm_[position * kN], product_[kPostLocal * 8U], postCopy);
+        DataCopyPad(hResGm_[position * kN * kN], rowAcc_[kResLocal], resStoreCopy);
+
         SetVectorMask<float>(8);
-        Mul<float, false>(resPack_[index * kN * kN], resPack_[index * kN * kN], rmsBrcb_,
-                          MASK_PLACEHOLDER, static_cast<uint8_t>((kN * kN) / 8U),
-                          broadcastStrides);
-        SetVectorMask<float>(static_cast<int32_t>(kN * kN));
-        Add<float, false>(resPack_[index * kN * kN], resPack_[index * kN * kN],
-                          biasFloat_[kBiasRes], MASK_PLACEHOLDER, 1U, contiguousBinary);
-
-        // pre 与 post 现在在两个缓冲里，各做一次 sigmoid。
-        SetVectorMask<float>(static_cast<int32_t>(kN));
-        Exp<float, false>(sigmoidTmp_, preAcc_, MASK_PLACEHOLDER, 1U, contiguousUnary);
-        Adds<float, false>(sigmoidTmp_, sigmoidTmp_, 1.0F, 1U);
-        Reciprocal<float, false>(preAcc_, sigmoidTmp_, MASK_PLACEHOLDER, 1U,
-                                 contiguousUnary);
-        Adds<float, false>(preAcc_, preAcc_, hcEps_, 1U);
-        Exp<float, false>(sigmoidTmp_, postPack_[index * 8U], MASK_PLACEHOLDER, 1U,
-                          contiguousUnary);
-        Adds<float, false>(sigmoidTmp_, sigmoidTmp_, 1.0F, 1U);
-        Reciprocal<float, false>(postPack_[index * 8U], sigmoidTmp_, MASK_PLACEHOLDER, 1U,
-                                 contiguousUnary);
-        Muls<float, false>(postPack_[index * 8U], postPack_[index * 8U], 2.0F, 1U);
-
-        // hIn：Brcb 把每个 hPre lane 展开成一个 block，再按 n 个 lane 加权求和。
-        Brcb(product_, preAcc_, 1U, {1, 8});
-        SetVectorMask<float>(8);
-        if constexpr (kRawX) {
-            AccumulateHIn(hInAcc_, xOff);
-            SetVectorMask<float>(static_cast<int32_t>(kD));
-            Cast<DT_X, float, false>(hInPack_[index * kD], hInAcc_, RoundMode::CAST_RINT,
-                                     MASK_PLACEHOLDER, 1U, {1, 1, 4, 8});
-        } else {
-            // x 已是 float 时直接累加到打包槽位，省掉一次搬运前的复制。
-            AccumulateHIn(hInPackFloat_[index * kD], xOff);
-        }
-    }
-
-    __aicore__ inline void AccumulateHIn(const LocalTensor<float> &dst, uint32_t xOff)
-    {
-        const BinaryRepeatParams broadcastStrides{1, 1, 1, 1, 1, 0};
-        Mul<float, false>(dst, xFloat_[xOff], product_, MASK_PLACEHOLDER, 2U,
+        Mul<float, false>(hInAcc_, xFloat_, product_, MASK_PLACEHOLDER, 2U,
                           broadcastStrides);
 #pragma unroll
         for (uint32_t lane = 1U; lane < kN; ++lane) {
-            MulAddDst<float, float, false>(dst, xFloat_[xOff + lane * kD],
+            MulAddDst<float, float, false>(hInAcc_, xFloat_[lane * kD],
                                            product_[lane * 8U], MASK_PLACEHOLDER, 2U,
                                            broadcastStrides);
         }
-    }
 
-    __aicore__ inline void StoreRange(uint64_t base, uint32_t count)
-    {
-        SyncVectorToMte3();
-        // 一段位置只发三笔搬运：hIn 与 hRes 在 UB 中已按位置连续；
-        // hPost 每位置占一个 32 字节 block，用 blockCount 跨步一次写成连续的 GM。
-        const DataCopyExtParams hInCopy{
-            1, static_cast<uint32_t>(count * kD * sizeof(DT_X)), 0, 0, 0};
-        const DataCopyExtParams postCopy{static_cast<uint16_t>(count),
-                                         kN * sizeof(DT_PARAM), 0, 0, 0};
-        const DataCopyExtParams resCopy{
-            1, static_cast<uint32_t>(count * kN * kN * sizeof(DT_PARAM)), 0, 0, 0};
-        DataCopyPad(hPostGm_[base * kN], postPack_, postCopy);
-        DataCopyPad(hResGm_[base * kN * kN], resPack_, resCopy);
         if constexpr (kRawX) {
-            DataCopyPad(hInGm_[base * kD], hInPack_, hInCopy);
+            SetVectorMask<float>(static_cast<int32_t>(kD));
+            Cast<DT_X, float, false>(xOutRaw_, hInAcc_, RoundMode::CAST_RINT,
+                                     MASK_PLACEHOLDER, 1U, {1, 1, 4, 8});
+        }
+        SyncVectorToMte3();
+        const DataCopyExtParams hInCopy{1, kD * sizeof(DT_X), 0, 0, 0};
+        if constexpr (kRawX) {
+            DataCopyPad(hInGm_[position * kD], xOutRaw_, hInCopy);
         } else {
-            DataCopyPad(hInGm_[base * kD], hInPackFloat_, hInCopy);
+            DataCopyPad(hInGm_[position * kD], hInAcc_, hInCopy);
         }
     }
 
@@ -378,21 +324,18 @@ private:
     GlobalTensor<DT_PARAM> hResGm_;
 
     LocalTensor<DT_X> xRaw_;
-    LocalTensor<DT_X> hInPack_;
+    LocalTensor<DT_X> xOutRaw_;
     LocalTensor<float> xFloat_;
     LocalTensor<float> phiFloat_;
     LocalTensor<float> biasFloat_;
     LocalTensor<float> gammaFloat_;
     LocalTensor<float> product_;
-    LocalTensor<float> reduceOut_;
-    LocalTensor<float> rmsBrcb_;
-    LocalTensor<float> preAcc_;
-    LocalTensor<float> sigmoidTmp_;
     LocalTensor<float> hInAcc_;
-    LocalTensor<float> xg_;
-    LocalTensor<float> hInPackFloat_;
-    LocalTensor<float> postPack_;
-    LocalTensor<float> resPack_;
+    LocalTensor<float> reduceOut_;
+    LocalTensor<float> sigmoidTmp_;
+    LocalTensor<float> postScale_;
+    LocalTensor<float> postEps_;
+    LocalTensor<float> rowAcc_;
 
     GM_ADDR tilingGm_ = nullptr;
     uint64_t positionCount_ = 0;
@@ -403,7 +346,6 @@ private:
     float alpha1_ = 0.0F;
     float alpha2_ = 0.0F;
 };
-
 
 // n=8 的历史最优官方路径（官方 3.32μs）。指令序列保持原样，
 // 只把原先硬编码的 eps/gamma/positionCount 改为显式传入，保证通用正确性。

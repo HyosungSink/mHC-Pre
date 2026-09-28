@@ -47,7 +47,7 @@ public:
         gammaFloat_ = LocalTensor<float>(TPosition::VECIN, kGammaFloatAddress, kWidth);
         product_ = LocalTensor<float>(TPosition::VECCALC, kProductAddress, kProductLength);
         reduceOut_ = LocalTensor<float>(TPosition::VECCALC, kReduceAddress, 64U);
-        rmsBrcb_ = LocalTensor<float>(TPosition::VECCALC, kRmsBrcbAddress, 8U);
+        rmsBrcb_ = LocalTensor<float>(TPosition::VECCALC, kRmsBrcbAddress, 64U);
         preAcc_ = LocalTensor<float>(TPosition::VECCALC, kPreAddress, 8U);
         sigmoidTmp_ = LocalTensor<float>(TPosition::VECCALC, kSigmoidAddress, 8U);
         hInAcc_ = LocalTensor<float>(TPosition::VECCALC, kHInAccAddress, kD);
@@ -139,8 +139,9 @@ private:
         Align32(kGammaFloatAddress + kWidth * 4U);
     static constexpr uint32_t kReduceAddress =
         Align32(kProductAddress + kProductLength * 4U);
+    // Brcb 单次 repeat 写 8 个 block，故此处需要 64 个 float 的空间。
     static constexpr uint32_t kRmsBrcbAddress = kReduceAddress + 64U * 4U;
-    static constexpr uint32_t kPreAddress = kRmsBrcbAddress + 32U;
+    static constexpr uint32_t kPreAddress = kRmsBrcbAddress + 64U * 4U;
     static constexpr uint32_t kSigmoidAddress = kPreAddress + 32U;
     static constexpr uint32_t kHInAccAddress = kSigmoidAddress + 32U;
     static constexpr uint32_t kPostPackAddress = Align32(kHInAccAddress + kD * 4U);
@@ -281,9 +282,13 @@ private:
                           contiguousBinary);
         Add<float, false>(postPack_[index * 8U], postPack_[index * 8U],
                           biasFloat_[kBiasPost], MASK_PLACEHOLDER, 1U, contiguousBinary);
-        SetVectorMask<float>(static_cast<int32_t>(kN * kN));
+        // invRms 只在 block 0，因此按 mask 8 多次 repeat、src1 repeat stride 取 0，
+        // 让每个 repeat 都重新读 block 0；mask 16 单 repeat 会读到 block 1 的无效值。
+        SetVectorMask<float>(8);
         Mul<float, false>(resPack_[index * kN * kN], resPack_[index * kN * kN], rmsBrcb_,
-                          MASK_PLACEHOLDER, 1U, broadcastStrides);
+                          MASK_PLACEHOLDER, static_cast<uint8_t>((kN * kN) / 8U),
+                          broadcastStrides);
+        SetVectorMask<float>(static_cast<int32_t>(kN * kN));
         Add<float, false>(resPack_[index * kN * kN], resPack_[index * kN * kN],
                           biasFloat_[kBiasRes], MASK_PLACEHOLDER, 1U, contiguousBinary);
 
